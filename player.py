@@ -137,9 +137,12 @@ class PlayerPanel(QFrame):
             self.player.play()
             return
         self.source = str(video)
+        # Set these after setSource: when switching videos, setSource reports
+        # LoadedMedia for the old video before the new one starts loading, which
+        # would use up the seek and play the new video from the start.
+        self.player.setSource(QUrl.fromLocalFile(str(video)))
         self.pending_ms = start
         self.pending_track = max(0, track - 1)
-        self.player.setSource(QUrl.fromLocalFile(str(video)))
         self.player.play()
 
     def toggle(self):
