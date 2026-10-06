@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Speech engine: downloaded by "orukeet install", machine-specific paths
+orukeet-cache/
+installation.json
+
+# Local notes and tooling
+CLAUDE.md
+.claude/
+
+# Leftovers
+*.lnk
+*.tmp

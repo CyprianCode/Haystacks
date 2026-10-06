@@ -1,0 +1,5 @@
+numpy>=2,<3
+PySide6-Essentials==6.11.2
+PySide6-Addons==6.11.2
+# Orukeet isn't on PyPI; install it straight from its release wheel.
+orukeet @ https://github.com/Oruk-AI/orukeet/releases/download/v0.1.1/orukeet-0.1.1-py3-none-any.whl
