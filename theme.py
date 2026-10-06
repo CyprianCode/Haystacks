@@ -134,6 +134,20 @@ QLineEdit#search {{ font-size: 15pt; padding: 8px 12px; }}
 QComboBox QAbstractItemView {{ background: {c['field']}; border: 1px solid {c['line']};
   selection-background-color: {c['accent_dim']}; selection-color: {c['ink']}; outline: none; }}
 
+QRadioButton {{ spacing: 8px; padding: 3px 0; }}
+QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 8px;
+  border: 1px solid {c['muted']}; background: {c['field']}; }}
+QRadioButton::indicator:hover {{ border-color: {c['accent']}; }}
+QRadioButton::indicator:checked {{ border-color: {c['accent']};
+  background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+    stop:0 {c['accent']}, stop:0.5 {c['accent']}, stop:0.62 {c['field']}, stop:1 {c['field']}); }}
+QRadioButton::indicator:disabled {{ border-color: {c['button_off_border']}; background: {c['button_off']}; }}
+QRadioButton::indicator:checked:disabled {{ border-color: {c['button_off_border']};
+  background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+    stop:0 {c['button_off_ink']}, stop:0.5 {c['button_off_ink']}, stop:0.62 {c['button_off']},
+    stop:1 {c['button_off']}); }}
+QRadioButton:disabled {{ color: {c['button_off_ink']}; }}
+
 QTreeWidget, QListWidget {{ background: {c['field']}; border: 1px solid {c['line']};
   border-radius: 4px; outline: none; }}
 QTreeWidget::item, QListWidget::item {{ padding: 6px 4px; }}
