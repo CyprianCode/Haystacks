@@ -14,3 +14,9 @@ CLAUDE.md
 # Leftovers
 *.lnk
 *.tmp
+
+# Build output (build.ps1 / release workflow)
+build/
+dist/
+THIRD-PARTY-LICENSES.txt
+assets/haystacks.png

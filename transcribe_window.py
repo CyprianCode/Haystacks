@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
                                QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                                QWidget)
 
+import engine
 import pipeline
 import theme
 import transcripts
@@ -147,6 +148,10 @@ class TranscribeWindow(QWidget):
         tl.setSpacing(6)
         top = QHBoxLayout()
         top.addWidget(label("Transcription", "section"))
+        top.addSpacing(12)
+        self.engine_btn = button("Speech engine", lambda: self.open_engine())
+        self.engine_btn.setToolTip("Download or switch the speech engine")
+        top.addWidget(self.engine_btn)
         top.addStretch(1)
         self.run_sel_btn = button("Transcribe selected folder",
                                   lambda: self.start(all_folders=False), accent=True)
@@ -197,7 +202,9 @@ class TranscribeWindow(QWidget):
         outer.addWidget(lp, 1)
 
         # Disabled during a run. The folder fields are handled by sync_folder_fields.
-        self.edit_widgets = [self.add_btn, self.import_btn, self.refresh_btn, self.run_sel_btn,
+        self.update_engine_btn()
+        self.edit_widgets = [self.add_btn, self.import_btn, self.refresh_btn, self.engine_btn,
+                             self.run_sel_btn,
                              self.run_all_btn]
 
         screen = QGuiApplication.primaryScreen().availableGeometry()
@@ -210,10 +217,6 @@ class TranscribeWindow(QWidget):
         else:
             self.on_select()
             self.log("Click 'Add folder...' to choose a folder of videos.")
-        if not pipeline.find_tool("ffmpeg"):
-            self.log("ffmpeg was not found. Install it from PowerShell with:\n"
-                     f"    {pipeline.APP_DIR}\\.venv\\Scripts\\python.exe -m pip install "
-                     "static-ffmpeg\nthen restart this app.")
         tr, dec = self.speed.get("transcribe"), self.speed.get("decode")
         if tr:
             speed = 1 / (1 / tr + (1 / dec if dec else 0.0))
@@ -376,6 +379,38 @@ class TranscribeWindow(QWidget):
         self.tree.setCurrentItem(self.tree.topLevelItem(len(self.folders) - 1))
         self.on_change()  # it may already hold transcripts from before
 
+    def update_engine_btn(self):
+        cur = engine.current()
+        short = {"cuda": "NVIDIA (CUDA)", "vulkan": "Vulkan", "cpu": "CPU"}
+        self.engine_btn.setText(f"Speech engine: {short[cur['device']]}" if cur
+                                else "Set up speech engine...")
+
+    def open_engine(self, first_time=False):
+        """Show the speech engine dialog. True if an engine is ready afterwards."""
+        from engine_dialog import EngineDialog
+        before = (engine.current() or {}).get("device")
+        dlg = EngineDialog(self, first_time)
+        dlg.exec()
+        if dlg.installed:
+            self.log(f"Speech engine ready: {engine.DEVICES[dlg.installed]}.")
+            if dlg.installed != before:  # speeds measured on another engine don't apply
+                self.speed.clear()
+                self.save()
+                self.set_readout("speed", "--", "speed")
+        self.update_engine_btn()
+        return engine.ready()
+
+    def has_work(self, jobs):
+        """True if any of these folders has a video still to transcribe."""
+        for job in jobs:
+            folder, out, _ = pipeline.entry_dirs(job)
+            try:
+                if pipeline.pending(folder, job["filter"], out)[1]:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def import_transcripts(self):
         dlg = ImportDialog(self, [f["path"] for f in self.folders], self.tracks_for)
         theme.style_window(dlg)
@@ -436,12 +471,6 @@ class TranscribeWindow(QWidget):
     # ---- running ----------------------------------------------------------
     def start(self, all_folders):
         self.apply_settings()
-        if not pipeline.find_tool("ffmpeg"):
-            QMessageBox.critical(self, "ffmpeg missing",
-                                 "ffmpeg is needed. Install it from PowerShell with:\n\n"
-                                 f"{pipeline.APP_DIR}\\.venv\\Scripts\\python.exe -m pip "
-                                 "install static-ffmpeg\n\nthen restart this app.")
-            return
         if all_folders:
             jobs = [dict(f) for f in self.folders]
         else:
@@ -450,6 +479,10 @@ class TranscribeWindow(QWidget):
         if not jobs:
             QMessageBox.information(self, "Transcribe", "Add or select a folder first.")
             return
+        if not engine.ready() and self.has_work(jobs):
+            # First transcription: set up the speech engine, then carry on.
+            if not self.open_engine(first_time=True):
+                return
         self.running = True
         self.stop.clear()
         self.run = {"start": time.time(), "files": 0, "audio": 0.0,

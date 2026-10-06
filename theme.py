@@ -97,6 +97,8 @@ QWidget {{ color: {c['ink']}; font-family: "{BODY}"; font-size: 10pt; }}
 QMainWindow, QDialog, QWidget#window {{ background: {c['bg']}; }}
 QFrame#panel {{ background: {c['panel']}; border: 1px solid {c['line']}; border-radius: 6px; }}
 QFrame#panel QLabel, QFrame#panel QFrame#row {{ background: transparent; }}
+QFrame#banner {{ background: {c['accent_dim']}; border: 1px solid {c['accent']}; border-radius: 6px; }}
+QFrame#banner QLabel {{ background: transparent; }}
 QLabel#title {{ font-family: "{HEAD}"; font-size: 20pt; }}
 QLabel#subtitle {{ color: {c['muted']}; padding-top: 8px; }}
 QLabel#section {{ font-family: "{HEAD}"; font-size: 13pt; }}

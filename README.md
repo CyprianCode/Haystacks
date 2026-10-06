@@ -26,69 +26,31 @@ recognition engine.
   Whisper JSON (openai-whisper, faster-whisper, whisper.cpp), and `.srt` /
   `.vtt` subtitles named like the videos (`clip.srt` or `clip.en.srt` for
   `clip.mp4`). Imported files are read in place and never changed.
+- **Updates itself.** When a new version is out, a banner offers to install
+  it with one click.
 - Video formats: `.mp4`, `.mkv`, `.mov`, `.avi`, `.mts`, `.m4v`, `.webm`.
 - Light and dark theme, following your Windows setting.
 
-## Requirements
+## Install
 
-- Windows 10 or 11
-- Python 3.12 or newer
-- ffmpeg
-- A GPU is recommended. On an NVIDIA GPU (CUDA) transcription runs at
-  hundreds of times real time; AMD and Intel GPUs work through Vulkan, and
-  CPU-only works too, just slower.
+1. Download `Haystacks-Setup-<version>.exe` from the
+   [latest release](https://github.com/CyprianStream/Haystacks/releases/latest).
+2. Run it. It installs for your Windows user only, so no administrator
+   rights are needed.
 
-## Setup
+   The installer isn't code-signed yet, so Windows may show "Windows
+   protected your PC". Click **More info**, then **Run anyway**.
+3. Start Haystacks from the Start menu. The first time you transcribe, it
+   downloads the speech engine (about 750 to 850 MB, once). It picks the
+   fastest engine for your PC, and you can switch later under **Add videos >
+   Speech engine**:
+   - **NVIDIA graphics card (CUDA):** hundreds of times faster than real time.
+   - **Other graphics cards (Vulkan),** such as AMD and Intel: several times
+     faster than the CPU.
+   - **CPU only:** works everywhere, just slower.
 
-Run these in PowerShell.
-
-1. **Install Python and Git** (skip if you have them):
-
-   ```powershell
-   winget install Python.Python.3.13 Git.Git
-   ```
-
-   Close and reopen PowerShell afterwards.
-
-2. **Download Haystacks and set up its Python environment:**
-
-   ```powershell
-   cd $HOME\Documents
-   git clone https://github.com/YOUR-USERNAME/Haystacks.git
-   cd Haystacks
-   py -3.13 -m venv .venv
-   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-   ```
-
-3. **Download the speech engine** (model and runtime, about 700 MB):
-
-   ```powershell
-   .\.venv\Scripts\orukeet.exe install --device auto --cache .\orukeet-cache --output installation.json
-   ```
-
-   `--device auto` picks CUDA on NVIDIA GPUs and otherwise the CPU. On an AMD
-   or Intel GPU, use `--device vulkan` instead; it is several times faster
-   than the CPU.
-
-4. **Install ffmpeg** (either one):
-
-   ```powershell
-   winget install Gyan.FFmpeg
-   ```
-
-   or, inside the app's environment:
-
-   ```powershell
-   .\.venv\Scripts\python.exe -m pip install static-ffmpeg
-   ```
-
-5. **Create a desktop shortcut:**
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\make_shortcut.ps1
-   ```
-
-   Or start it directly: `.\.venv\Scripts\pythonw.exe Haystacks.pyw`
+Requirements: 64-bit Windows 10 or 11. Searching imported transcripts works
+without the speech engine.
 
 ## Where things are stored
 
@@ -98,8 +60,54 @@ Run these in PowerShell.
   kept; audio is decoded from the video into memory.
 - **Settings** (folder list, hidden recordings, window layout):
   `%APPDATA%\Haystacks\settings.json`.
+- **The app** is installed in `%LOCALAPPDATA%\Programs\Haystacks`.
+- **The speech engine** is stored in `%LOCALAPPDATA%\Haystacks\engine`.
 - "Clear finished videos..." in Add videos deletes only the files Haystacks
   wrote in `_Haystacks`, never your videos.
+- Uninstalling (Windows Settings > Apps) removes the app and the speech
+  engine; your videos, transcripts and settings stay.
+
+## Run from source
+
+For development. Run these in PowerShell:
+
+```powershell
+winget install Python.Python.3.13 Git.Git
+cd $HOME\Documents
+git clone https://github.com/CyprianStream/Haystacks.git
+cd Haystacks
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\pythonw.exe Haystacks.pyw
+```
+
+The speech engine is set up from inside the app on first use, as above.
+`powershell -ExecutionPolicy Bypass -File .\make_shortcut.ps1` creates a
+desktop shortcut to the source version.
+
+## Building and releasing
+
+- **Build an installer locally:**
+
+  ```powershell
+  winget install JRSoftware.InnoSetup
+  powershell -ExecutionPolicy Bypass -File .\build.ps1
+  ```
+
+  This produces `dist\Haystacks-Setup-<version>.exe`.
+- **Publish a release:**
+  1. Set the new number in `version.py`, for example `0.2.0`.
+  2. Commit, then tag and push:
+
+     ```powershell
+     git commit -am "Release 0.2.0"
+     git tag v0.2.0
+     git push origin main v0.2.0
+     ```
+
+  The [Release workflow](.github/workflows/release.yml) builds the installer
+  and publishes it on GitHub. Installed copies offer the update within a
+  day.
 
 ## Project layout
 
@@ -109,23 +117,31 @@ Run these in PowerShell.
 | `search_window.py` | Main window: search, filters, results list, Loudest moments. |
 | `player.py` | Built-in video player panel. |
 | `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing. |
-| `pipeline.py` | ffmpeg/ffprobe, audio decoding, Orukeet, loudness, output files. |
+| `engine.py`, `engine_dialog.py` | Downloading and choosing the speech engine. |
+| `updater.py`, `update_banner.py` | Checking GitHub for new versions and installing them. |
+| `pipeline.py` | Reading audio (PyAV), Orukeet, loudness, output files. |
 | `search_data.py` | Turns a folder of transcripts into search data. |
 | `library.py` | Search logic, independent of the UI. |
 | `transcripts.py` | Reads every importable transcript format. |
 | `measure.py` | Background loudness and date measuring for imported folders. |
 | `theme.py` | Colors, fonts, stylesheet and icons. |
-| `make_shortcut.ps1` | Creates the desktop shortcut. |
+| `paths.py`, `version.py` | Where files live; the version number. |
+| `haystacks.spec`, `installer.iss`, `build.ps1` | Building the app and its installer. |
+| `tools/third_party.py` | Writes the license notices bundled with the installer. |
+| `assets/` | The app icon and the script that draws it. |
 
 ## License
 
 Haystacks is free software, licensed under the
 [GNU General Public License v3.0](LICENSE).
 
-It uses, but does not include:
+The installer includes Python, [PySide6 / Qt](https://www.qt.io/qt-for-python)
+(LGPL-3.0), [NumPy](https://numpy.org) (BSD-3-Clause),
+[PyAV](https://pyav.org) (BSD-3-Clause) with [FFmpeg](https://ffmpeg.org)
+(LGPL-2.1-or-later), and [Orukeet](https://github.com/Oruk-AI/orukeet)'s
+Python package (MIT). Their full license texts are in
+`THIRD-PARTY-LICENSES.txt` next to the installed app.
 
-- [Orukeet](https://github.com/Oruk-AI/orukeet): MIT License. Its model
-  weights (downloaded by `orukeet install`) are licensed CC BY-SA 4.0.
-- [PySide6 / Qt](https://www.qt.io/qt-for-python): LGPL-3.0.
-- [NumPy](https://numpy.org): BSD-3-Clause.
-- [ffmpeg](https://ffmpeg.org): installed separately; LGPL/GPL.
+The Orukeet speech model is downloaded on first use and is licensed
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). It is based
+on NVIDIA Parakeet TDT 0.6B v3.

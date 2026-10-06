@@ -24,6 +24,8 @@ import theme
 from library import Library, hms, highlight_spans, parse_terms
 from measure import Measurer
 from player import PlayerPanel
+from update_banner import UpdateBanner
+from version import __version__
 
 HINTS = {
     "search": 'All words must appear in the same sentence. Put words in "quotes" for an '
@@ -364,7 +366,8 @@ class MainWindow(QMainWindow):
         self.measurer = Measurer(settings, busy=lambda: bool(self.tw and self.tw.running))
         QTimer.singleShot(4000, self.measurer.start)  # after the first load settles
 
-        self.setWindowTitle("Haystacks")
+        self.setWindowTitle(f"Haystacks {__version__}")
+        self.force_quit = False  # set when an update closes the app
         self.setMinimumSize(980, 640)
         central = QWidget()
         central.setObjectName("window")
@@ -393,6 +396,12 @@ class MainWindow(QMainWindow):
         add.clicked.connect(self.open_transcriber)
         head.addWidget(add)
         outer.addLayout(head)
+
+        # "New version available", hidden until an update check finds one.
+        self.banner = UpdateBanner(settings, save,
+                                   busy=lambda: bool(self.tw and self.tw.running),
+                                   quit_app=self.quit_for_update)
+        outer.addWidget(self.banner)
 
         # Search controls
         sp = theme.panel()
@@ -807,8 +816,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def quit_for_update(self):
+        self.force_quit = True
+        self.close()
+
     def closeEvent(self, event):
-        if self.tw and self.tw.running and QMessageBox.question(
+        if not self.force_quit and self.tw and self.tw.running and QMessageBox.question(
                 self, "Transcription running",
                 "Videos are still being transcribed. Quit anyway?\n\n"
                 "The video in progress will be redone next time.") != QMessageBox.Yes:
@@ -816,6 +829,7 @@ class MainWindow(QMainWindow):
             return
         self.player.stop()
         self.measurer.stop()
+        self.banner.stop()
         self.settings["ui"] = {
             "geometry": bytes(self.saveGeometry().toBase64()).decode(),
             "split": bytes(self.split.saveState().toBase64()).decode()}

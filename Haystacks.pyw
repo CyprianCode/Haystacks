@@ -7,12 +7,10 @@ the transcription window (transcribe_window.py): add a folder, pick the
 audio track, press Transcribe. Finished videos are skipped, so you can stop
 anytime and continue later.
 
-Needs the other .py files of the project in the same folder, the .venv
-(see requirements.txt) and installation.json set up in this folder, and
-ffmpeg. See README.md.
-
-Start it with the desktop shortcut (make_shortcut.ps1 creates it), or from
-this folder:
+Installed copies are built with PyInstaller (haystacks.spec) and set up by
+the installer (installer.iss); the speech engine is downloaded from inside
+the app on first use. From source: install requirements.txt into .venv, then
+start it with the desktop shortcut (make_shortcut.ps1 creates it), or:
     .\\.venv\\Scripts\\pythonw.exe Haystacks.pyw
 """
 import json
@@ -37,7 +35,9 @@ def show_error(text):
 
 
 try:
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
+    import paths
     import pipeline
     import theme
     from search_window import MainWindow
@@ -71,8 +71,14 @@ def save_settings(data):
 
 def main():
     pipeline.cleanup_temp()
+    try:  # own taskbar entry and icon, instead of Python's
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Haystacks.Haystacks")
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     app.setApplicationName("Haystacks")
+    app.setWindowIcon(QIcon(str(paths.resource("assets/haystacks.ico"))))
     theme.apply(app)
     # Errors inside the app show a box instead of vanishing (no console).
     sys.excepthook = lambda kind, value, tb: show_error(

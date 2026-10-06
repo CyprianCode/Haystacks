@@ -1,7 +1,8 @@
 """
 Transcription pipeline used by the Haystacks app. Not run directly.
 
-Audio is decoded straight from each video by ffmpeg into memory: no audio
+Audio is decoded straight from each video into memory with PyAV (FFmpeg's
+libraries, which ship with it), so no separate ffmpeg is needed and no audio
 files are kept. Outputs go to the folder's transcripts location: normally
 <video folder>\\_Haystacks\\, or wherever imported transcripts already live
 (the folder entry's "transcripts"):
@@ -19,26 +20,22 @@ import os
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import av
 import numpy as np
 
+import paths
 import transcripts
 from search_data import VIDEO_EXTS, WINDOW_S, collect, write_atomic
 
-APP_DIR = Path(__file__).resolve().parent
-
-# ---- Settings: edit these -------------------------------------------------
-INSTALL_JSON = APP_DIR / "installation.json"  # written by "orukeet install"
-# ---------------------------------------------------------------------------
-
 SAMPLE_RATE = 16000
+RESAMPLE_CHUNK_S = 5  # decoded audio is resampled in chunks of this many seconds
 OUT_NAME = "_Haystacks"
-NO_WINDOW = 0x08000000  # don't flash a console window for each ffmpeg call
+NO_WINDOW = 0x08000000  # don't flash a console window for helper programs
 
 
 def keep_awake(on: bool):
@@ -51,32 +48,12 @@ def keep_awake(on: bool):
         pass
 
 
-def find_tool(name):
-    """Path to ffmpeg/ffprobe: on PATH, from the static-ffmpeg pip package,
-    next to this app, or where winget puts it."""
-    found = shutil.which(name)
-    if found:
-        return found
+def open_media(video: Path):
+    """Open a video with PyAV. Raises RuntimeError with a readable message."""
     try:
-        import static_ffmpeg  # pip install static-ffmpeg
-        static_ffmpeg.add_paths()  # puts its ffmpeg/ffprobe on PATH
-        found = shutil.which(name)
-        if found:
-            return found
-    except Exception:
-        pass
-    candidates = [APP_DIR / f"{name}.exe"]
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        candidates.append(Path(local) / "Microsoft" / "WinGet" / "Links" / f"{name}.exe")
-    for p in candidates:
-        if p.exists():
-            return str(p)
-    return None
-
-
-def run_tool(args):
-    return subprocess.run(args, capture_output=True, creationflags=NO_WINDOW)
+        return av.open(str(video), metadata_errors="ignore")
+    except Exception as e:
+        raise RuntimeError(f"can't read {video.name}: {e}") from None
 
 
 def out_dir(folder: Path, transcripts_dir=None) -> Path:
@@ -106,25 +83,25 @@ def pending(folder: Path, name_filter: str, out=None):
     return videos, [v for v in videos if v.stem not in done]
 
 
+def stream_channels(stream):
+    ctx = stream.codec_context
+    with contextlib.suppress(Exception):
+        return ctx.layout.nb_channels
+    return getattr(ctx, "channels", None)
+
+
 def list_tracks(video: Path):
     """Audio tracks in a video as [(number from 1, description)]."""
-    ffprobe = find_tool("ffprobe")
-    if not ffprobe:
-        raise RuntimeError("ffprobe not found")
-    r = run_tool([ffprobe, "-v", "error", "-select_streams", "a",
-                  "-show_entries", "stream=codec_name,channels:stream_tags=language,title",
-                  "-of", "json", str(video)])
-    if r.returncode:
-        raise RuntimeError(r.stderr.decode(errors="replace").strip())
     tracks = []
-    for n, s in enumerate(json.loads(r.stdout).get("streams", []), 1):
-        tags = {k.lower(): v for k, v in s.get("tags", {}).items()}
-        lang = tags.get("language", "")
-        parts = [tags.get("title"),
-                 LANGUAGES.get(lang, lang) if lang not in ("", "und") else None,
-                 channel_name(s.get("channels")),
-                 codec_name(s.get("codec_name", ""))]
-        tracks.append((n, ", ".join(p for p in parts if p)))
+    with open_media(video) as container:
+        for n, s in enumerate(container.streams.audio, 1):
+            tags = {k.lower(): v for k, v in s.metadata.items()}
+            lang = tags.get("language", "")
+            parts = [tags.get("title"),
+                     LANGUAGES.get(lang, lang) if lang not in ("", "und") else None,
+                     channel_name(stream_channels(s)),
+                     codec_name(s.codec_context.name or "")]
+            tracks.append((n, ", ".join(p for p in parts if p)))
     return tracks
 
 
@@ -147,33 +124,21 @@ def codec_name(codec):
 
 
 def probe_duration(video: Path):
-    """Length of a video in seconds, or None if ffprobe can't tell."""
-    ffprobe = find_tool("ffprobe")
-    if not ffprobe:
-        return None
-    r = run_tool([ffprobe, "-v", "error", "-show_entries", "format=duration",
-                  "-of", "csv=p=0", str(video)])
+    """Length of a video in seconds, or None if it can't be told."""
     try:
-        return float(r.stdout.decode().strip()) or None
-    except ValueError:
+        with open_media(video) as container:
+            return container.duration / av.time_base if container.duration else None
+    except RuntimeError:
         return None
 
 
 def probe_created(video: Path):
     """Recording date stored in the video (creation_time), as a local-time
     'YYYY-MM-DDTHH:MM:SS' string, or None if the video has no date.
-    Raises if ffprobe can't read the file, so a failed read isn't saved as
+    Raises if the file can't be read, so a failed read isn't saved as
     'no date'."""
-    ffprobe = find_tool("ffprobe")
-    if not ffprobe:
-        raise RuntimeError("ffprobe not found")
-    r = run_tool([ffprobe, "-v", "error", "-show_entries",
-                  "format_tags:stream_tags", "-of", "json", str(video)])
-    if r.returncode:
-        raise RuntimeError(r.stderr.decode(errors="replace").strip())
-    info = json.loads(r.stdout or b"{}")
-    tag_sets = [info.get("format", {}).get("tags", {})]
-    tag_sets += [s.get("tags", {}) for s in info.get("streams", [])]
+    with open_media(video) as container:
+        tag_sets = [dict(container.metadata)] + [dict(s.metadata) for s in container.streams]
     for tags in tag_sets:
         for key, raw in tags.items():
             if key.lower() not in ("creation_time", "date_utc", "date"):
@@ -193,42 +158,58 @@ def probe_created(video: Path):
 def decode_audio(video: Path, track: int, duration=None, on_progress=None,
                  cancel=None) -> np.ndarray:
     """One audio track (numbered from 1) as 16 kHz mono 16-bit samples.
-    on_progress(fraction) is called as audio arrives, if duration is known.
-    Setting the `cancel` event stops ffmpeg and raises InterruptedError."""
-    ffmpeg = find_tool("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("ffmpeg not found")
-    p = subprocess.Popen([ffmpeg, "-nostdin", "-v", "error", "-i", str(video),
-                          "-map", f"0:a:{track - 1}", "-vn", "-ac", "1",
-                          "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         creationflags=NO_WINDOW)
-    # Drain stderr on the side so a chatty ffmpeg can't block on a full pipe.
-    err_chunks = []
-    reader = threading.Thread(target=lambda: err_chunks.append(p.stderr.read()),
-                              daemon=True)
-    reader.start()
-    expected = duration * SAMPLE_RATE * 2 if duration else 0
-    buf = bytearray()
-    while True:
-        chunk = p.stdout.read(1 << 20)
-        if not chunk:
-            break
-        buf.extend(chunk)
-        if cancel is not None and cancel.is_set():
-            p.kill()
-            p.wait()
-            raise InterruptedError("stopped")
-        if on_progress and expected:
-            on_progress(min(len(buf) / expected, 1.0))
-    returncode = p.wait()
-    reader.join()
-    if returncode:
-        err = b"".join(err_chunks).decode(errors="replace").strip().splitlines()
-        if any("matches no streams" in line for line in err):
+    on_progress(fraction) is called as audio arrives, if the length is known.
+    Setting the `cancel` event stops reading and raises InterruptedError."""
+    out = []
+    with open_media(video) as container:
+        streams = container.streams.audio
+        if len(streams) < track:
             raise RuntimeError(f"this video has no audio track {track}")
-        raise RuntimeError(err[-1] if err else f"ffmpeg exit code {returncode}")
-    audio = np.frombuffer(buf[: len(buf) // 2 * 2], dtype="<i2")
+        stream = streams[track - 1]
+        # Skip the video (and other tracks) at the file level: a 4K camera file
+        # then reads ~10x faster, and far less comes over the network.
+        for other in container.streams:
+            if other is not stream:
+                other.discard = av.stream.Discard.all
+        total = duration or (container.duration / av.time_base if container.duration else 0)
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        # Decoded frames are tiny (~1024 samples); resampling them in chunks of
+        # a few seconds instead is much faster and gives identical output.
+        pending, key, count = [], None, 0
+
+        def flush():
+            nonlocal pending, count
+            if pending:
+                fmt, layout, rate = key
+                chunk = av.AudioFrame.from_ndarray(np.concatenate(pending, axis=1),
+                                                   format=fmt, layout=layout)
+                chunk.sample_rate = rate
+                out.extend(f.to_ndarray() for f in resampler.resample(chunk))
+            pending, count = [], 0
+
+        try:
+            for frame in container.decode(stream):
+                k = (frame.format.name, frame.layout.name, frame.sample_rate)
+                if k != key:
+                    flush()
+                    key = k
+                pending.append(frame.to_ndarray())
+                count += frame.samples
+                if count >= RESAMPLE_CHUNK_S * frame.sample_rate:
+                    flush()
+                    if cancel is not None and cancel.is_set():
+                        raise InterruptedError("stopped")
+                    if on_progress and total and frame.time is not None:
+                        on_progress(min(max(frame.time / total, 0.0), 1.0))
+        except av.error.FFmpegError as e:
+            if not (out or pending):
+                raise RuntimeError(f"can't decode audio track {track}: {e}") from None
+            # A damaged end of file: keep what was read, like ffmpeg does.
+        flush()
+        out.extend(f.to_ndarray() for f in resampler.resample(None))  # the resampler's tail
+    if on_progress:
+        on_progress(1.0)
+    audio = np.concatenate(out, axis=1).ravel().astype("<i2") if out else np.zeros(0, "<i2")
     if not len(audio):
         raise RuntimeError(f"audio track {track} is empty")
     return audio
@@ -251,15 +232,16 @@ def loudness(audio: np.ndarray) -> list:
 def load_asr():
     """Load Orukeet. Returns the context manager; use it in a with block."""
     from orukeet import Orukeet
-    if not INSTALL_JSON.exists():
-        raise RuntimeError(f"{INSTALL_JSON} not found. Run 'orukeet install' "
-                           f"in {APP_DIR} first (see README.md).")
-    cfg = json.loads(INSTALL_JSON.read_text(encoding="utf-8-sig"))
+    install = paths.install_json()
+    if not install.exists():
+        raise RuntimeError("The speech engine isn't set up yet. Open Add videos and "
+                           "click Speech engine... to set it up.")
+    cfg = json.loads(install.read_text(encoding="utf-8-sig"))
     # Paths in installation.json may be relative to its folder (.\orukeet-cache).
     for key in ("model", "runtime"):
         p = Path(str(cfg[key]))
-        if not p.is_absolute() and (INSTALL_JSON.parent / p).exists():
-            cfg[key] = str(INSTALL_JSON.parent / p)
+        if not p.is_absolute() and (install.parent / p).exists():
+            cfg[key] = str(install.parent / p)
     return Orukeet(cfg["model"], cfg["runtime"], device=cfg["device"]), cfg["device"]
 
 
@@ -370,8 +352,6 @@ def log_failure(video: Path, error, out=None):
 def add_missing_dates(folder: Path, log=print):
     """Store the video's recording date in transcripts made before dates were
     read from videos (no "created" key yet). Done once per transcript."""
-    if not find_tool("ffprobe"):
-        return
     out = out_dir(folder)
     videos = {v.stem.lower(): v for v in list_videos(folder, "")}
     todo = []
@@ -470,31 +450,22 @@ def measure_loudness(video: Path, track: int, out: Path, cancel=None):
     write_atomic(out / "_loudness" / f"{video.stem}.json", json.dumps(loudness(audio)))
 
 
-def find_player():
-    """(kind, path) of a player that can start at a given time: VLC if
-    installed, else ffplay (comes with ffmpeg). (None, None) if neither."""
+def find_vlc():
+    """Path to VLC if installed (it can start at a given time), else None."""
     vlc = shutil.which("vlc")
     for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
         if not vlc and base and (Path(base) / "VideoLAN" / "VLC" / "vlc.exe").exists():
             vlc = str(Path(base) / "VideoLAN" / "VLC" / "vlc.exe")
-    if vlc:
-        return "vlc", vlc
-    ffplay = find_tool("ffplay")
-    return ("ffplay", ffplay) if ffplay else (None, None)
+    return vlc
 
 
 def play_video(video: Path, seconds: float):
-    """Play a video starting a couple of seconds before `seconds`.
-    Returns the player kind used ("vlc", "ffplay" or "default")."""
-    start = max(0, int(seconds) - 2)
-    kind, player = find_player()
-    if kind == "vlc":
-        subprocess.Popen([player, f"--start-time={start}", str(video)])
-    elif kind == "ffplay":
-        subprocess.Popen([player, "-ss", str(start), "-window_title", video.name,
-                          "-x", "1280", "-y", "720", str(video)],
-                         creationflags=NO_WINDOW)
-    else:
-        os.startfile(video)  # can't seek; opens at the start
-        kind = "default"
-    return kind
+    """Open a video in another player, a couple of seconds before `seconds`.
+    Returns "vlc", or "default" for the Windows default player (which can't
+    seek, so it starts at the beginning)."""
+    vlc = find_vlc()
+    if vlc:
+        subprocess.Popen([vlc, f"--start-time={max(0, int(seconds) - 2)}", str(video)])
+        return "vlc"
+    os.startfile(video)
+    return "default"

@@ -1,0 +1,70 @@
+# Builds the Windows installer and publishes it as a GitHub release.
+# Triggered by pushing a version tag that matches version.py:
+#     git tag v0.1.0
+#     git push origin v0.1.0
+# Installed copies of Haystacks find the new release through the GitHub API
+# and offer the update.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # create the release and upload the installer
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag matches version.py
+        shell: pwsh
+        run: |
+          $version = (python -c "from version import __version__; print(__version__)").Trim()
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match version.py ($version). Bump version.py or fix the tag."
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build the app
+        shell: pwsh
+        run: |
+          python tools/third_party.py
+          python -m PyInstaller --noconfirm --clean haystacks.spec
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup --no-progress -y
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /Q "/DAppVersion=$env:VERSION" installer.iss
+          $setup = "dist\Haystacks-Setup-$env:VERSION.exe"
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  Haystacks-Setup-$env:VERSION.exe" | Out-File -Encoding ascii "$setup.sha256"
+
+      # GitHub's own gh CLI (preinstalled on the runner) rather than a
+      # third-party action: this job can write to the repo, and its output is
+      # what every installed copy updates to.
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/Haystacks-Setup-$env:VERSION.exe" `
+            "dist/Haystacks-Setup-$env:VERSION.exe.sha256" `
+            --title "Haystacks $env:VERSION" --generate-notes
