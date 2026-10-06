@@ -34,7 +34,7 @@ recognition engine, or a Whisper model if you prefer.
 ## Install
 
 1. Download `Haystacks-Setup-<version>.exe` from the
-   [latest release](https://github.com/CyprianStream/Haystacks/releases/latest).
+   [latest release](https://github.com/CyprianCode/Haystacks/releases/latest).
 2. Run it. It installs for your Windows user only, so no administrator
    rights are needed.
 
@@ -104,7 +104,7 @@ For development. Run these in PowerShell:
 ```powershell
 winget install Python.Python.3.13 Git.Git
 cd $HOME\Documents
-git clone https://github.com/CyprianStream/Haystacks.git
+git clone https://github.com/CyprianCode/Haystacks.git
 cd Haystacks
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt

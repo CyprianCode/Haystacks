@@ -22,7 +22,7 @@ from pathlib import Path
 
 from version import __version__
 
-REPO = "CyprianStream/Haystacks"
+REPO = "CyprianCode/Haystacks"
 TEST_URL = os.environ.get("HAYSTACKS_UPDATE_URL")
 API_URL = TEST_URL or f"https://api.github.com/repos/{REPO}/releases/latest"
 CHECK_EVERY_S = 24 * 3600
