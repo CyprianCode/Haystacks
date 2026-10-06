@@ -8,6 +8,11 @@ moment in a built-in player. Nothing is uploaded anywhere; transcription runs
 locally with the [Orukeet](https://github.com/Oruk-AI/orukeet) speech
 recognition engine, or a Whisper model if you prefer.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/search-dark.png">
+  <img alt="Searching for &quot;camera&quot;: matching sentences grouped by recording, with the video playing at the selected moment" src="docs/screenshots/search-light.png">
+</picture>
+
 ## Features
 
 - **Transcribe folders of videos.** Add a folder, pick which audio track to
@@ -30,6 +35,16 @@ recognition engine, or a Whisper model if you prefer.
   it with one click.
 - Video formats: `.mp4`, `.mkv`, `.mov`, `.avi`, `.mts`, `.m4v`, `.webm`.
 - Light and dark theme, following your Windows setting.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/add-videos-dark.png">
+  <img alt="The Add videos window during a run: folders, progress bars, time remaining and speed" src="docs/screenshots/add-videos-light.png" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/loudest-dark.png">
+  <img alt="Loudest moments: the loudest moments across all recordings, with what was said at the time" src="docs/screenshots/loudest-light.png">
+</picture>
 
 ## Install
 
@@ -160,6 +175,7 @@ desktop shortcut to the source version.
 | `haystacks.spec`, `installer.iss`, `build.ps1` | Building the app and its installer. |
 | `tools/third_party.py` | Writes the license notices bundled with the installer. |
 | `assets/` | The app icon and the script that draws it. |
+| `docs/screenshots/` | Screenshots for this README (light and dark), taken with made-up demo recordings. |
 
 ## License
 
