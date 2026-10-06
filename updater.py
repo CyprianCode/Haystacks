@@ -97,12 +97,19 @@ def download(release, on_progress=None, cancel=None):
     expected = expected_sha256(release)
     if not expected:
         raise RuntimeError("this release has no checksum, so it can't be verified")
-    target = Path(tempfile.gettempdir()) / release["name"]
+    return fetch_file(release["url"], Path(tempfile.gettempdir()) / release["name"],
+                      expected, release["size"], on_progress, cancel)
+
+
+def fetch_file(url, target: Path, sha256=None, size=0, on_progress=None, cancel=None):
+    """Download url to target through a .part file. With sha256, a file that
+    doesn't match is deleted and refused. Returns target."""
+    target = Path(target)
     part = target.with_name(target.name + ".part")
     digest = hashlib.sha256()
     got = 0
-    with _get(release["url"], timeout=60) as resp, open(part, "wb") as f:
-        total = int(resp.headers.get("Content-Length") or release["size"] or 0)
+    with _get(url, timeout=60) as resp, open(part, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or size or 0)
         while True:
             if cancel is not None and cancel.is_set():
                 f.close()
@@ -116,7 +123,7 @@ def download(release, on_progress=None, cancel=None):
             got += len(block)
             if on_progress:
                 on_progress(got, total)
-    if digest.hexdigest() != expected:
+    if sha256 and digest.hexdigest() != sha256.lower():
         part.unlink(missing_ok=True)
         raise RuntimeError("the download is damaged (checksum mismatch); try again later")
     part.replace(target)

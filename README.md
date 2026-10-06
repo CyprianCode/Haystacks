@@ -6,7 +6,7 @@ Haystacks is a Windows desktop app that transcribes whole folders of videos
 on your own PC, then lets you search what was said and jump straight to that
 moment in a built-in player. Nothing is uploaded anywhere; transcription runs
 locally with the [Orukeet](https://github.com/Oruk-AI/orukeet) speech
-recognition engine.
+recognition engine, or a Whisper model if you prefer.
 
 ## Features
 
@@ -48,6 +48,36 @@ recognition engine.
    - **Other graphics cards (Vulkan),** such as AMD and Intel: several times
      faster than the CPU.
    - **CPU only:** works everywhere, just slower.
+
+### Choosing a speech model
+
+Orukeet is the default and is recommended for English and 24 other European
+languages. In **Add videos > Speech engine** you can switch to another model
+(each is downloaded once, when first chosen):
+
+| Model | Good for | Download |
+|---|---|---|
+| **Orukeet** (recommended) | English and European languages; fastest | ~800 MB |
+| **Whisper large-v3-turbo** | 99 languages, very accurate | 574 MB + engine |
+| **Whisper small** | 99 languages on slower PCs; less accurate | 190 MB + engine |
+| **Distil-Whisper large-v3** | English only, faster than full Whisper | 1.5 GB + engine |
+| **Custom Whisper model** | Any [whisper.cpp](https://github.com/ggml-org/whisper.cpp) model file (`.bin`), e.g. one fine-tuned for your language; a file on your PC or a download link | varies |
+| **Custom command** | Any speech program you already use | none |
+
+Whisper models run with [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+(engine download: 9 MB for the CPU, about 675 MB for NVIDIA cards). They use
+NVIDIA graphics cards or the CPU; on AMD and Intel graphics Orukeet is much
+faster. Whisper models let you set the spoken language or detect it.
+
+**Custom command:** enter a command line with `{input}` and `{output}`, for
+example `"C:\Tools\my-asr.exe" --audio {input} --out {output}`. `{input}` is
+a 16 kHz mono WAV file; `{output}` is a path without an extension, and the
+program must write `{output}.json` (Whisper or whisper.cpp JSON),
+`{output}.srt` or `{output}.vtt`. Haystacks tests the command on two seconds
+of silence before using it.
+
+Switching models doesn't change videos that are already transcribed; use
+"Clear finished videos..." to redo a folder with the new model.
 
 Requirements: 64-bit Windows 10 or 11. Searching imported transcripts works
 without the speech engine.
@@ -117,9 +147,10 @@ desktop shortcut to the source version.
 | `search_window.py` | Main window: search, filters, results list, Loudest moments. |
 | `player.py` | Built-in video player panel. |
 | `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing. |
-| `engine.py`, `engine_dialog.py` | Downloading and choosing the speech engine. |
+| `engine.py`, `engine_dialog.py` | Choosing, downloading and testing the speech model and engine. |
+| `asr_external.py` | Runs whisper.cpp or a custom command as the speech engine. |
 | `updater.py`, `update_banner.py` | Checking GitHub for new versions and installing them. |
-| `pipeline.py` | Reading audio (PyAV), Orukeet, loudness, output files. |
+| `pipeline.py` | Reading audio (PyAV), transcribing, loudness, output files. |
 | `search_data.py` | Turns a folder of transcripts into search data. |
 | `library.py` | Search logic, independent of the UI. |
 | `transcripts.py` | Reads every importable transcript format. |
@@ -144,4 +175,5 @@ Python package (MIT). Their full license texts are in
 
 The Orukeet speech model is downloaded on first use and is licensed
 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). It is based
-on NVIDIA Parakeet TDT 0.6B v3.
+on NVIDIA Parakeet TDT 0.6B v3. The optional Whisper models, Distil-Whisper
+and whisper.cpp are downloaded only if chosen, and are licensed MIT.

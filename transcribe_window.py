@@ -381,19 +381,18 @@ class TranscribeWindow(QWidget):
 
     def update_engine_btn(self):
         cur = engine.current()
-        short = {"cuda": "NVIDIA (CUDA)", "vulkan": "Vulkan", "cpu": "CPU"}
-        self.engine_btn.setText(f"Speech engine: {short[cur['device']]}" if cur
+        self.engine_btn.setText(f"Speech engine: {engine.label(cur)}" if cur
                                 else "Set up speech engine...")
 
     def open_engine(self, first_time=False):
         """Show the speech engine dialog. True if an engine is ready afterwards."""
         from engine_dialog import EngineDialog
-        before = (engine.current() or {}).get("device")
+        before = engine.key(engine.current())
         dlg = EngineDialog(self, first_time)
         dlg.exec()
         if dlg.installed:
-            self.log(f"Speech engine ready: {engine.DEVICES[dlg.installed]}.")
-            if dlg.installed != before:  # speeds measured on another engine don't apply
+            self.log(f"Speech engine ready: {engine.label(dlg.installed)}.")
+            if engine.key(dlg.installed) != before:  # speeds measured on another engine don't apply
                 self.speed.clear()
                 self.save()
                 self.set_readout("speed", "--", "speed")
@@ -542,10 +541,10 @@ class TranscribeWindow(QWidget):
                         if self.stop.is_set():
                             break
                         if asr is None:  # load the model only if there is work
-                            post("status", "Loading Orukeet...")
-                            model, device = pipeline.load_asr()
+                            post("status", "Loading the speech engine...")
+                            model, name = pipeline.load_asr()
                             asr = stack.enter_context(model)
-                            log(f"Orukeet ready ({device}).")
+                            log(f"Speech engine ready ({name}).")
                         est = lengths.get(video, 0.0)
                         post("video", done + 1, video.name, est)
                         post("status", f"Working in {folder.name}")

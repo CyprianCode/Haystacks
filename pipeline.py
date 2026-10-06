@@ -28,7 +28,7 @@ from pathlib import Path
 import av
 import numpy as np
 
-import paths
+import engine
 import transcripts
 from search_data import VIDEO_EXTS, WINDOW_S, collect, write_atomic
 
@@ -230,24 +230,15 @@ def loudness(audio: np.ndarray) -> list:
 
 
 def load_asr():
-    """Load Orukeet. Returns the context manager; use it in a with block."""
-    from orukeet import Orukeet
-    install = paths.install_json()
-    if not install.exists():
-        raise RuntimeError("The speech engine isn't set up yet. Open Add videos and "
-                           "click Speech engine... to set it up.")
-    cfg = json.loads(install.read_text(encoding="utf-8-sig"))
-    # Paths in installation.json may be relative to its folder (.\orukeet-cache).
-    for key in ("model", "runtime"):
-        p = Path(str(cfg[key]))
-        if not p.is_absolute() and (install.parent / p).exists():
-            cfg[key] = str(install.parent / p)
-    return Orukeet(cfg["model"], cfg["runtime"], device=cfg["device"]), cfg["device"]
+    """Load the chosen speech engine. Returns (context manager, its name);
+    use the first in a with block."""
+    cfg = engine.current()
+    return engine.load(cfg), engine.label(cfg)
 
 
 def transcribe(asr, audio: np.ndarray) -> dict:
-    """Orukeet takes a file path, so the audio goes through a temporary WAV
-    on the local disk, deleted as soon as transcription finishes."""
+    """Every engine takes a file path, so the audio goes through a temporary
+    WAV on the local disk, deleted as soon as transcription finishes."""
     fd, name = tempfile.mkstemp(prefix="Haystacks-", suffix=".wav")
     os.close(fd)
     tmp = Path(name)
@@ -263,8 +254,11 @@ def transcribe(asr, audio: np.ndarray) -> dict:
 
 
 def cleanup_temp():
-    """Delete temporary WAVs left behind if the app was closed mid-file."""
-    for p in Path(tempfile.gettempdir()).glob("Haystacks-*.wav"):
+    """Delete temporary WAVs (and transcripts written by external engines)
+    left behind if the app was closed mid-file."""
+    tmp = Path(tempfile.gettempdir())
+    for p in [p for ext in ("wav", "out", "json", "srt", "vtt")
+              for p in tmp.glob(f"Haystacks-*.{ext}")]:
         try:
             p.unlink()
         except OSError:

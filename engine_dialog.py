@@ -1,111 +1,219 @@
 """
-The "Speech engine" dialog: one-time download of the Orukeet model and the
-runtime that suits this PC, with progress, plus switching device later.
+The "Speech engine" dialog: pick a speech model (Orukeet by default), where it
+runs, and do the one-time download with progress. Also used to switch later.
 """
 import queue
 import threading
 import time
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QButtonGroup, QDialog, QHBoxLayout, QLabel, QProgressBar,
-                               QPushButton, QRadioButton, QVBoxLayout)
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import (QButtonGroup, QComboBox, QDialog, QFileDialog, QHBoxLayout,
+                               QLabel, QLineEdit, QProgressBar, QPushButton, QRadioButton,
+                               QVBoxLayout, QWidget)
 
 import engine
 import theme
 
 MB = 1_000_000
+DEVICE_NOTES = {"cuda": "fastest", "vulkan": "fast; AMD, Intel and NVIDIA cards",
+                "cpu": "slowest, works on every PC"}
+
+
+def label(text, name=None):
+    w = QLabel(text)
+    if name:
+        w.setObjectName(name)
+    w.setWordWrap(True)
+    return w
 
 
 class EngineDialog(QDialog):
     def __init__(self, parent=None, first_time=False):
         super().__init__(parent)
         self.setWindowTitle("Speech engine")
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(660)
         self.msgs = queue.Queue()
         self.busy = False
-        self.installed = None  # device name once set up
+        self.installed = None  # installation config once set up
+        cur = engine.current()
+        self.cur = cur if cur and not first_time else None
+        cur_model = engine.model_id(self.cur) if self.cur else engine.DEFAULT
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 18, 22, 18)
-        lay.setSpacing(10)
-        head = QLabel("Speech engine")
-        head.setObjectName("section")
-        lay.addWidget(head)
-        cur = engine.current()
-        intro = ("Haystacks transcribes on this PC with the Orukeet speech engine. "
-                 "Before the first transcription it needs a one-time download of about "
-                 "750 to 850 MB." if first_time or not cur else
-                 f"Installed: {engine.DEVICES[cur['device']]}. You can switch to another "
+        lay.setSpacing(8)
+        lay.addWidget(label("Speech engine", "section"))
+        intro = ("Haystacks transcribes on this PC. Orukeet is recommended; the other "
+                 "models suit other languages. The chosen model is downloaded once."
+                 if not self.cur else
+                 f"Installed: {engine.label(self.cur)}. You can switch to another model or "
                  "engine; files already downloaded are reused.")
-        text = QLabel(intro)
-        text.setObjectName("muted")
-        text.setWordWrap(True)
-        lay.addWidget(text)
+        lay.addWidget(label(intro, "muted"))
 
-        best, reason = engine.recommended()
-        self.choice = QButtonGroup(self)
-        notes = {"cuda": "fastest", "vulkan": "fast; AMD, Intel and NVIDIA cards",
-                 "cpu": "slowest, works on every PC"}
+        # Custom Whisper model: a file or a link.
+        self.custom = QWidget()
+        row = QHBoxLayout(self.custom)
+        row.setContentsMargins(24, 0, 0, 0)
+        self.path = QLineEdit()
+        self.path.setPlaceholderText("Model file (.bin) or https:// download link")
+        if self.cur and engine.model_id(self.cur) == "custom":
+            self.path.setText(self.cur.get("model", ""))
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self.browse)
+        row.addWidget(self.path, 1)
+        row.addWidget(browse)
+
+        # Custom command.
+        self.command_box = QWidget()
+        col = QVBoxLayout(self.command_box)
+        col.setContentsMargins(24, 0, 0, 0)
+        self.command = QLineEdit()
+        self.command.setPlaceholderText('"C:\\Tools\\my-asr.exe" --audio {input} --out {output}')
+        if self.cur and self.cur.get("engine") == "command":
+            self.command.setText(self.cur["command"])
+        col.addWidget(self.command)
+        col.addWidget(label("{input} is a 16 kHz mono WAV file. {output} is a path without an "
+                            "extension: the program must write {output}.json (Whisper or "
+                            "whisper.cpp format), {output}.srt or {output}.vtt.", "caption"))
+
+        self.extras = {"custom": self.custom, "command": self.command_box}
+        lay.addWidget(label("Model", "section"))
+        self.models = QButtonGroup(self)
+        for mid, m in engine.MODELS.items():
+            text = f"{m['name']}: {m['note']}"
+            if mid == engine.DEFAULT:
+                text += "  (recommended)"
+            b = QRadioButton(text)
+            b.setProperty("model", mid)
+            b.setChecked(mid == cur_model)
+            self.models.addButton(b)
+            lay.addWidget(b)
+            if mid in self.extras:  # its settings go right under it
+                lay.addWidget(self.extras[mid])
+        self.models.buttonToggled.connect(lambda b, on: on and self.model_changed())
+
+        # Language, for Whisper models.
+        self.lang_row = QWidget()
+        row = QHBoxLayout(self.lang_row)
+        row.setContentsMargins(0, 4, 0, 0)
+        row.addWidget(QLabel("Language:"))
+        self.language = QComboBox()
+        self.language.setEditable(True)  # any Whisper language code
+        for code, name in engine.LANGUAGES:
+            self.language.addItem(name, code)
+        lang = (self.cur or {}).get("language", "auto")
+        i = self.language.findData(lang)
+        if i >= 0:
+            self.language.setCurrentIndex(i)
+        else:
+            self.language.setEditText(lang)
+        row.addWidget(self.language)
+        row.addStretch(1)
+        lay.addWidget(self.lang_row)
+
+        self.device_head = label("Run on", "section")
+        lay.addWidget(self.device_head)
+        self.devices = QButtonGroup(self)
+        self.device_buttons = {}
         for device, name in engine.DEVICES.items():
-            label = f"{name}: {notes[device]}"
-            if device == best:
-                label += f"  (recommended: {reason})"
-            b = QRadioButton(label)
+            b = QRadioButton()
             b.setProperty("device", device)
-            b.setChecked(device == (cur["device"] if cur and not first_time else best))
-            self.choice.addButton(b)
+            self.devices.addButton(b)
+            self.device_buttons[device] = b
             lay.addWidget(b)
 
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setVisible(False)
         lay.addWidget(self.bar)
-        self.status = QLabel("")
-        self.status.setWordWrap(True)
+        self.status = label("")
         lay.addWidget(self.status)
 
-        credit = QLabel('Speech model: <a href="https://github.com/Oruk-AI/orukeet">Orukeet</a> '
-                        "by Oruk AI, based on NVIDIA Parakeet TDT 0.6B v3, licensed "
-                        '<a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>.')
-        credit.setObjectName("caption")
-        credit.setOpenExternalLinks(True)
-        credit.setWordWrap(True)
-        lay.addWidget(credit)
+        self.credit = label("", "caption")
+        self.credit.setOpenExternalLinks(True)
+        lay.addWidget(self.credit)
 
         row = QHBoxLayout()
         row.addStretch(1)
         self.close_btn = QPushButton("Cancel")
         self.close_btn.clicked.connect(self.reject)
-        self.go = QPushButton("Download and set up" if not cur else "Switch engine")
+        self.go = QPushButton("Download and set up" if not self.cur else "Switch")
         self.go.setProperty("accent", True)
         self.go.clicked.connect(self.start)
         row.addWidget(self.close_btn)
         row.addWidget(self.go)
         lay.addLayout(row)
         self.timer = QTimer(self, interval=250, timeout=self.poll)
+        self.model_changed(initial=True)
+
+    # ---- choice -------------------------------------------------------------
+    def model(self):
+        return self.models.checkedButton().property("model")
 
     def device(self):
-        return self.choice.checkedButton().property("device")
+        b = self.devices.checkedButton()
+        device = b.property("device") if b else None
+        return device if device in engine.MODELS[self.model()]["devices"] else None
+
+    def model_changed(self, initial=False):
+        mid = self.model()
+        m = engine.MODELS[mid]
+        self.custom.setVisible(mid == "custom")
+        self.command_box.setVisible(mid == "command")
+        self.lang_row.setVisible(m["engine"] == "whisper" and "language" not in m)
+        self.device_head.setVisible(bool(m["devices"]))
+        best, reason = engine.recommended(mid)
+        keep = self.cur["device"] if initial and self.cur and self.cur.get("device") in m["devices"] else best
+        for device, b in self.device_buttons.items():
+            text = f"{engine.DEVICES[device]}: {DEVICE_NOTES[device]}"
+            if device == best:
+                text += f"  (recommended: {reason})"
+            b.setText(text)
+            b.setVisible(device in m["devices"])
+            if device == keep:
+                b.setChecked(True)
+        self.credit.setText(m["credit"])
+        self.credit.setVisible(bool(m["credit"]))
+        self.adjustSize()
+
+    def browse(self):
+        name, _ = QFileDialog.getOpenFileName(self, "Whisper model file", "",
+                                              "whisper.cpp models (*.bin);;All files (*)")
+        if name:
+            self.path.setText(name)
+
+    def choice(self):
+        lang = self.language.currentData()
+        if lang is None or self.language.currentText() != self.language.itemText(
+                self.language.currentIndex()):
+            lang = self.language.currentText().strip() or "auto"  # typed by hand
+        return {"model": self.model(), "device": self.device() or "cpu", "language": lang,
+                "path": self.path.text(), "command": self.command.text()}
+
+    # ---- setup --------------------------------------------------------------
+    def set_editable(self, on):
+        for w in (self.models.buttons() + self.devices.buttons()
+                  + [self.custom, self.command_box, self.lang_row, self.go]):
+            w.setEnabled(on)
 
     def start(self):
-        device = self.device()
-        model_bytes, runtime_bytes = engine.sizes(device)
-        # Downloads land in the cache folder, and runtimes are unzipped there
+        choice = self.choice()
+        file_bytes, archive_bytes = engine.sizes(choice)
+        # Downloads land in the cache folder, and archives are unpacked there
         # too, so its growth tracks progress well enough for a bar.
-        self.expected = model_bytes + 2 * runtime_bytes
+        self.expected = file_bytes + 2 * archive_bytes
         self.start_size = engine.folder_size(engine.cache_dir())
         self.busy = True
-        for b in self.choice.buttons():
-            b.setEnabled(False)
-        self.go.setEnabled(False)
+        self.set_editable(False)
         self.close_btn.setEnabled(False)
         self.bar.setVisible(True)
         self.bar.setRange(0, 1000 if self.expected else 0)
+        self.status.setText("")
         self.started = time.time()
 
         def work():
             try:
-                self.msgs.put(("done", engine.install(device, log=lambda t: self.msgs.put(("log", t)))))
+                self.msgs.put(("done", engine.install(choice, log=lambda t: self.msgs.put(("log", t)))))
             except Exception as e:
                 self.msgs.put(("error", str(e)))
         threading.Thread(target=work, daemon=True).start()
@@ -135,17 +243,17 @@ class EngineDialog(QDialog):
                 self.status.setText(f"Downloading: {got // MB:,} of about "
                                     f"{self.expected // MB:,} MB{when}")
 
-    def finish(self, device):
+    def finish(self, cfg):
         self.timer.stop()
         self.busy = False
-        self.installed = device
+        self.installed = cfg
         self.bar.setRange(0, 1000)
         self.bar.setValue(1000)
+        msg = f"Ready: {engine.label(cfg)}."
         chosen = self.device()
-        msg = f"Ready: {engine.DEVICES[device]}."
-        if device != chosen:
+        if chosen and cfg.get("device") != chosen:
             msg = (f"The {engine.DEVICES[chosen]} engine didn't work on this PC, so "
-                   f"Haystacks will use the {engine.DEVICES[device]}. " + msg)
+                   f"Haystacks will use the {engine.DEVICES[cfg['device']]}. " + msg)
         self.status.setText(msg)
         self.go.setVisible(False)
         self.close_btn.setText("Done")
@@ -160,11 +268,10 @@ class EngineDialog(QDialog):
         self.timer.stop()
         self.busy = False
         self.bar.setVisible(False)
-        self.status.setText(f"Setup didn't finish: {error}\n\nCheck the internet connection "
-                            "and try again; finished parts are kept.")
-        for b in self.choice.buttons():
-            b.setEnabled(True)
-        self.go.setEnabled(True)
+        hint = ("Check the command and try again." if self.model() == "command" else
+                "Check the internet connection and try again; finished parts are kept.")
+        self.status.setText(f"Setup didn't finish: {error}\n\n{hint}")
+        self.set_editable(True)
         self.go.setText("Try again")
         self.close_btn.setEnabled(True)
 

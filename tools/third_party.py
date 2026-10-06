@@ -27,6 +27,11 @@ Its source is at https://ffmpeg.org/download.html.
 The Orukeet speech model is not bundled: it is downloaded on first use and is
 licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/); it is
 an adaptation of NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0).
+
+The optional Whisper models are not bundled either: they are downloaded only
+when chosen in the Speech engine dialog. whisper.cpp
+(https://github.com/ggml-org/whisper.cpp), OpenAI Whisper and Distil-Whisper
+are licensed MIT.
 """
 
 
