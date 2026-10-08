@@ -51,7 +51,7 @@ def recording_date(data, stem):
     if created:
         try:
             when = dt.datetime.fromisoformat(created)
-            return when, date_label(when)
+            return when, date_label(when, "T" in created)  # "2024-06-13": a day, no time
         except ValueError:
             pass
     return parse_date(stem)

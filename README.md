@@ -31,6 +31,15 @@ recognition engine, or a Whisper model if you prefer.
   Whisper JSON (openai-whisper, faster-whisper, whisper.cpp), and `.srt` /
   `.vtt` subtitles named like the videos (`clip.srt` or `clip.en.srt` for
   `clip.mp4`). Imported files are read in place and never changed.
+- **Search YouTube videos** by what is said in them. Paste a link to a video,
+  playlist or channel under **Add videos > Add YouTube...** and Haystacks
+  fetches the subtitles YouTube already has (the uploader's own, or else
+  YouTube's automatic captions; a few KB per video, no video is downloaded).
+  Results play in the built-in player, with the same controls. See
+  [YouTube videos](#youtube-videos).
+- **Link your own transcripts to YouTube.** Have a transcript of a video
+  that's on YouTube? **Add videos > Link to YouTube...** pairs the file with
+  the video's link, and its results play the YouTube video.
 - **Updates itself.** When a new version is out, a banner offers to install
   it with one click.
 - Video formats: `.mp4`, `.mkv`, `.mov`, `.avi`, `.mts`, `.m4v`, `.webm`.
@@ -97,20 +106,58 @@ Switching models doesn't change videos that are already transcribed; use
 Requirements: 64-bit Windows 10 or 11. Searching imported transcripts works
 without the speech engine.
 
+### YouTube videos
+
+**Add videos > Add YouTube...** takes a link to a single video, a playlist or a
+channel, and a subtitle language. Haystacks downloads
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) the first time (about 18 MB, kept
+up to date automatically), then fetches one subtitle file per video. Select the
+YouTube entry and press **Get new subtitles** (or **Transcribe all folders**) at
+any time to add new uploads; videos already fetched are skipped.
+
+- Videos without subtitles in that language are skipped and tried again on
+  later runs (automatic captions can take a few hours to appear after upload).
+- Automatic captions have more mistakes than the speech engine, and sometimes
+  no punctuation.
+- Playing needs an internet connection. A few videos can't be played outside
+  YouTube by their owner's choice; right-click a result and choose **Open on
+  YouTube** to watch it there, at the same moment.
+- YouTube limits how fast subtitles can be fetched. For a big channel it may
+  stop partway with a message; what was fetched is kept, and running it again
+  later continues.
+- YouTube videos have no loudness data, so they don't appear in Loudest
+  moments.
+
+**Transcripts you already have:** **Add videos > Link to YouTube...** takes a
+transcript file (Haystacks or Whisper JSON, `.srt` or `.vtt`) and the link to
+the video on YouTube. The file is read where it is and never changed; its
+folder is added to the list like imported transcripts. You can also
+right-click any result and choose **Link to YouTube video...** (or **Change**
+/ **Remove YouTube link**). If the video file is also on your PC, results
+still play it from there, and **Open on YouTube** is in the right-click menu.
+Transcript files named like yt-dlp's (`<title> [<video id>].en.vtt`) are
+linked automatically when imported. The transcript's timings must match the
+uploaded video: a transcript of a longer or edited recording will be off.
+
 ## Where things are stored
 
 - **Transcripts** for each folder go in a `_Haystacks` folder inside it:
   `<stem>.json` per video, plus `_loudness\` (loudness data) and
   `_failed.txt` (if a video couldn't be transcribed). No audio files are
   kept; audio is decoded from the video into memory.
+- **YouTube subtitles** go in `%LOCALAPPDATA%\Haystacks\YouTube\<name>` (or
+  the folder you chose): one `.vtt` per video, named
+  `<upload date> <title> [<video id>].<language>.vtt`, plus `_youtube.json`
+  (videos that had no subtitles).
 - **Settings** (folder list, hidden recordings, window layout):
   `%APPDATA%\Haystacks\settings.json`.
 - **The app** is installed in `%LOCALAPPDATA%\Programs\Haystacks`.
-- **The speech engine** is stored in `%LOCALAPPDATA%\Haystacks\engine`.
+- **The speech engine** is stored in `%LOCALAPPDATA%\Haystacks\engine`, and
+  yt-dlp in `%LOCALAPPDATA%\Haystacks\engine\yt-dlp`.
 - "Clear finished videos..." in Add videos deletes only the files Haystacks
   wrote in `_Haystacks`, never your videos.
-- Uninstalling (Windows Settings > Apps) removes the app and the speech
-  engine; your videos, transcripts and settings stay.
+- Uninstalling (Windows Settings > Apps) removes the app, the speech engine
+  and yt-dlp; your videos, transcripts, YouTube subtitles and settings stay.
 
 ## Run from source
 
@@ -161,7 +208,9 @@ desktop shortcut to the source version.
 | `Haystacks.pyw` | Entry point: settings, theme, crash dialog. |
 | `search_window.py` | Main window: search, filters, results list, Loudest moments. |
 | `player.py` | Built-in video player panel. |
-| `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing. |
+| `youtube.py` | Fetching YouTube subtitles with yt-dlp. |
+| `youtube_view.py` | Playing YouTube videos in the player panel (Qt WebEngine). |
+| `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing, adding YouTube videos. |
 | `engine.py`, `engine_dialog.py` | Choosing, downloading and testing the speech model and engine. |
 | `asr_external.py` | Runs whisper.cpp or a custom command as the speech engine. |
 | `updater.py`, `update_banner.py` | Checking GitHub for new versions and installing them. |
@@ -183,7 +232,8 @@ Haystacks is free software, licensed under the
 [GNU General Public License v3.0](LICENSE).
 
 The installer includes Python, [PySide6 / Qt](https://www.qt.io/qt-for-python)
-(LGPL-3.0), [NumPy](https://numpy.org) (BSD-3-Clause),
+(LGPL-3.0) including Qt WebEngine (Chromium, BSD-3-Clause and others),
+[NumPy](https://numpy.org) (BSD-3-Clause),
 [PyAV](https://pyav.org) (BSD-3-Clause) with [FFmpeg](https://ffmpeg.org)
 (LGPL-2.1-or-later), and [Orukeet](https://github.com/Oruk-AI/orukeet)'s
 Python package (MIT). Their full license texts are in
@@ -193,3 +243,5 @@ The Orukeet speech model is downloaded on first use and is licensed
 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). It is based
 on NVIDIA Parakeet TDT 0.6B v3. The optional Whisper models, Distil-Whisper
 and whisper.cpp are downloaded only if chosen, and are licensed MIT.
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) is downloaded only when YouTube
+videos are added, and is released under the Unlicense.

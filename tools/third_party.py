@@ -24,6 +24,15 @@ libraries are separate DLL files in the _internal folder and can be replaced.
 FFmpeg (inside PyAV and Qt Multimedia) is used under the LGPL-2.1-or-later.
 Its source is at https://ffmpeg.org/download.html.
 
+Qt WebEngine (used to play YouTube videos) contains Chromium, which is
+licensed BSD-3-Clause and includes third-party code under its own licenses;
+see https://doc.qt.io/qt-6/qtwebengine-licensing.html and
+https://www.chromium.org/chromium-projects/ for the source and the full list.
+
+yt-dlp (https://github.com/yt-dlp/yt-dlp), which fetches YouTube subtitles,
+is not bundled: it is downloaded on first use. It is released under the
+Unlicense (public domain).
+
 The Orukeet speech model is not bundled: it is downloaded on first use and is
 licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/); it is
 an adaptation of NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0).

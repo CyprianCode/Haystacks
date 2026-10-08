@@ -11,19 +11,21 @@ from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QByteArray, QDate, QEvent, QModelIndex,
-                            QRect, QSize, Qt, QTimer, Signal)
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter, QPen, QShortcut, QTextDocument
+                            QRect, QSize, Qt, QTimer, QUrl, Signal)
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter, QPen, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QComboBox,
-                               QDateEdit, QDialog, QHBoxLayout, QLabel, QLineEdit,
-                               QListView, QListWidget, QMainWindow, QMenu, QMessageBox,
+                               QDateEdit, QDialog, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QListView, QListWidget, QMainWindow, QMenu,
+                               QMessageBox,
                                QPushButton, QSplitter, QStackedWidget, QStyle,
                                QStyledItemDelegate, QVBoxLayout, QWidget)
 
 import pipeline
 import theme
+import youtube
 from library import Library, hms, highlight_spans, parse_terms
 from measure import Measurer
-from player import PlayerPanel
+from player import LEAD_IN_S, PlayerPanel
 from update_banner import UpdateBanner
 from version import __version__
 
@@ -143,17 +145,18 @@ class ResultsDelegate(QStyledItemDelegate):
         base = r.top() + r.height() // 2 + QFontMetrics(self.head).ascent() // 2 - 1
         p.setFont(self.head)
         p.setPen(QColor(c["ink"]))
-        title = f["label"] or f["stem"]
+        title = f["label"] or f["name"]
         p.drawText(x, base, title)
         x += QFontMetrics(self.head).horizontalAdvance(title) + 12
         p.setFont(self.small)
         p.setPen(QColor(c["muted"]))
-        meta = (f"{f['stem']}    " if f["label"] else "") + \
+        meta = (f"{f['name']}    " if f["label"] else "") + \
             f"{count} {'match' if count == 1 else 'matches'}"
         p.drawText(x, base, meta)
 
     def paint_time(self, p, x, y, fi, t, c):
-        has_video = self.view.lib.files[fi]["video"] is not None
+        f = self.view.lib.files[fi]
+        has_video = f["video"] is not None or f["youtube"] is not None
         p.setFont(self.bold)
         p.setPen(QColor(c["accent"] if has_video else c["muted"]))
         p.drawText(x, y + QFontMetrics(self.bold).ascent(), hms(t))
@@ -210,7 +213,7 @@ class ResultsDelegate(QStyledItemDelegate):
             pill = self.pill_rect(r, row)
             label_w = pill.left() - x - 10
             p.drawText(QRect(x, top, label_w, self.line), Qt.AlignLeft | Qt.AlignVCenter,
-                       QFontMetrics(self.small).elidedText(f["label"] or f["stem"],
+                       QFontMetrics(self.small).elidedText(f["label"] or f["name"],
                                                            Qt.ElideRight, label_w))
             width = r.right() - PAD - x
             self.rich(p, x, top + self.line, width, self.line,
@@ -242,7 +245,7 @@ class ResultsDelegate(QStyledItemDelegate):
         p.setPen(QColor(c["muted"]))
         label_w = pill.left() - x - 10
         p.drawText(QRect(x, top, label_w, self.line), Qt.AlignLeft | Qt.AlignVCenter,
-                   QFontMetrics(self.small).elidedText(f["label"] or f["stem"],
+                   QFontMetrics(self.small).elidedText(f["label"] or f["name"],
                                                        Qt.ElideRight, label_w))
         width = r.right() - PAD - x
         if si >= 0:
@@ -701,13 +704,20 @@ class MainWindow(QMainWindow):
     def play_row(self, row):
         fi, t = self.row_target(row)
         f = self.lib.files[fi]
-        if not f["video"] or not f["video"].exists():
+        local = f["video"] is not None and f["video"].exists()
+        if f["youtube"] and not local:  # a recording on disk plays from disk
+            self.results.playing_key = self.results.row_key(row)
+            self.results.viewport().update()
+            self.player.play_youtube(f["youtube"], t, f["label"] or f["name"],
+                                     f"{f['name']}  at {hms(t)}")
+            return
+        if not local:
             QMessageBox.information(self, "Play video", f"Can't find the video for "
                                     f"{f['stem']}. It may have been moved or renamed.")
             return
         self.results.playing_key = self.results.row_key(row)
         self.results.viewport().update()
-        title = f["label"] or f["stem"]
+        title = f["label"] or f["name"]
         subtitle = f"{f['video'].name}  at {hms(t)}"
         self.player.play_at(f["video"], t, title, subtitle, self.track_for(f["folder"]))
 
@@ -717,22 +727,83 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if row[0] != "head":
             menu.addAction("Play here", lambda: self.play_row(row))
-            menu.addAction("Open in another player", lambda: self.play_external(fi, t))
+            if f["video"]:
+                menu.addAction("Open in another player", lambda: self.play_external(fi, t))
+            if f["youtube"]:
+                menu.addAction("Open on YouTube", lambda: self.open_youtube(fi, t))
+                menu.addAction("Copy YouTube link to this moment",
+                               lambda: QGuiApplication.clipboard().setText(
+                                   youtube.watch_url(f["youtube"], max(0, t - LEAD_IN_S))))
         if f["video"]:
             menu.addAction("Show video in its folder", lambda: subprocess.Popen(
                 ["explorer", "/select,", str(f["video"])]))
         if row[0] == "hit":
             menu.addAction("Copy sentence", lambda: QGuiApplication.clipboard().setText(
                 self.lib.segs[row[1]][2]))
+        entry = self.entry_for(f["folder"])
+        if entry is not None and not entry.get("youtube"):  # YouTube subtitles are linked already
+            linked = f["stem"] in entry.get("links", {})
+            menu.addSeparator()
+            menu.addAction("Change YouTube link..." if linked else "Link to YouTube video...",
+                           lambda: self.link_youtube(fi))
+            if linked:
+                menu.addAction("Remove YouTube link", lambda: self.set_link(fi, None))
         menu.addSeparator()
         menu.addAction("Hide recording", lambda: self.hide(fi))
         menu.exec(pos)
 
-    def play_external(self, fi, t):
-        video = self.lib.files[fi]["video"]
-        if not video or not video.exists():
+    def entry_for(self, folder):
+        return next((e for e in self.settings.get("folders", []) if e["path"] == folder), None)
+
+    def link_youtube(self, fi):
+        """Ask for the YouTube video a recording's transcript belongs to."""
+        f = self.lib.files[fi]
+        current = youtube.watch_url(f["youtube"]) if f["youtube"] else ""
+        while True:
+            text, ok = QInputDialog.getText(
+                self, "Link to YouTube video",
+                f"Link to the video on YouTube for\n{f['label'] or f['name']}:\n\n"
+                "Results from this recording will play it when the video file isn't "
+                "on this PC. Its timings must match the transcript.",
+                QLineEdit.Normal, current)
+            if not ok or not text.strip():
+                return
+            vid = youtube.parse_url(text)
+            if vid:
+                return self.set_link(fi, vid)
+            QMessageBox.information(self, "Link to YouTube video",
+                                    "That doesn't look like a YouTube video link. It should "
+                                    "look like https://www.youtube.com/watch?v=... or "
+                                    "https://youtu.be/...")
+            current = text
+
+    def set_link(self, fi, vid):
+        """Store (or with None, remove) a recording's YouTube link."""
+        f = self.lib.files[fi]
+        entry = self.entry_for(f["folder"])
+        if entry is None:
             return
-        self.player.player.pause()
+        links = entry.setdefault("links", {})
+        if vid:
+            links[f["stem"]] = vid
+        else:
+            links.pop(f["stem"], None)
+        self.save()
+        self.reload(background=True)
+
+    def open_youtube(self, fi, t):
+        self.player.pause()
+        vid = self.lib.files[fi]["youtube"]
+        QDesktopServices.openUrl(QUrl(youtube.watch_url(vid, max(0, t - LEAD_IN_S))))
+
+    def play_external(self, fi, t):
+        f = self.lib.files[fi]
+        video = f["video"]
+        if not video or not video.exists():
+            if f["youtube"]:
+                self.open_youtube(fi, t)
+            return
+        self.player.pause()
         kind = pipeline.play_video(video, t)
         if kind == "default":
             self.status.setText("Opened the video from the start in your default player.")

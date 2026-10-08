@@ -6,6 +6,7 @@ import datetime as dt
 import re
 
 import pipeline
+import youtube
 
 
 def hms(t):
@@ -33,8 +34,9 @@ class Library:
     """Search data of every folder merged into one, oldest recording first."""
 
     def __init__(self, entries):
-        """entries: the settings folder entries ({"path", optional "transcripts"})."""
-        self.files = []    # dicts: folder, stem, video, when, label, key, date
+        """entries: the settings folder entries ({"path", optional "transcripts",
+        "youtube", "links": {stem: YouTube video id}})."""
+        self.files = []    # dicts: folder, stem, name, video, youtube, when, label, key, date
         self.segs = []     # (file index, start, text, dB or None), in file order
         self.moments = []  # (file index, time, dB, seg index or -1)
         per = []
@@ -42,29 +44,34 @@ class Library:
             folder, out, _ = pipeline.entry_dirs(entry)
             data = pipeline.load_folder(folder, out)
             if data:
-                per.append((entry["path"], data))
+                per.append((entry["path"], data, entry.get("links") or {}))
 
         order = sorted((f[2] is None, f[2] or dt.datetime.min, f[0].lower(), k, lf)
-                       for k, (_, (files, *_)) in enumerate(per)
+                       for k, (_, (files, *_), _) in enumerate(per)
                        for lf, f in enumerate(files))
         seg_ids = {}
-        for k, (_, (_, segs, _, _)) in enumerate(per):
+        for k, (_, (_, segs, _, _), _) in enumerate(per):
             for gi, s in enumerate(segs):
                 seg_ids.setdefault((k, s[0]), []).append(gi)
 
         new_fi, new_si = {}, {}
         for *_, k, lf in order:
-            path, (files, segs, _, _) = per[k]
+            path, (files, segs, _, _), links = per[k]
             stem, video, when, label = files[lf]
             new_fi[k, lf] = fi = len(self.files)
-            self.files.append({"folder": path, "stem": stem, "video": video, "when": when,
+            # A YouTube video: linked by hand, or named "... [id]" (YouTube
+            # subtitles, or yt-dlp files imported with no video of their own).
+            named = youtube.video_id(stem) if video is None else None
+            vid = links.get(stem) or named
+            self.files.append({"folder": path, "stem": stem, "video": video, "youtube": vid,
+                               "name": youtube.title(stem) if named else stem, "when": when,
                                "label": label, "key": f"{path}|{stem}",
                                "date": when.date().isoformat() if when else None})
             for gi in seg_ids.get((k, lf), []):
                 new_si[k, gi] = len(self.segs)
                 _, start, text, db = segs[gi]
                 self.segs.append((fi, start, text, db))
-        for k, (_, (_, _, moments, _)) in enumerate(per):
+        for k, (_, (_, _, moments, _), _) in enumerate(per):
             for lf, t, db, si in moments:
                 self.moments.append((new_fi[k, lf], t, db,
                                      new_si.get((k, si), -1) if si >= 0 else -1))
