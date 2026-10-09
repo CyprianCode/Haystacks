@@ -345,8 +345,11 @@ def log_failure(video: Path, error, out=None):
 
 def add_missing_dates(folder: Path, log=print):
     """Store the video's recording date in transcripts made before dates were
-    read from videos (no "created" key yet). Done once per transcript."""
+    read from videos (no "created" key yet). Done once per transcript.
+    Returns the number of transcripts updated."""
     out = out_dir(folder)
+    if not out.is_dir():
+        return 0
     videos = {v.stem.lower(): v for v in list_videos(folder, "")}
     todo = []
     for jp in out.glob("*.json"):
@@ -358,7 +361,7 @@ def add_missing_dates(folder: Path, log=print):
         if "created" not in data and video:
             todo.append((jp, data, video))
     if not todo:
-        return
+        return 0
     log(f"Reading recording dates from {len(todo)} videos...")
 
     def probe(item):
@@ -367,6 +370,7 @@ def add_missing_dates(folder: Path, log=print):
         except Exception:
             return False, None  # unreadable right now; try again after the next run
 
+    updated = 0
     with ThreadPoolExecutor(8) as pool:
         for (jp, data, _), (ok, created) in zip(todo, pool.map(probe, todo)):
             if ok:
@@ -374,6 +378,8 @@ def add_missing_dates(folder: Path, log=print):
                         **{k: v for k, v in data.items() if k != "file"}}
                 write_atomic(jp, json.dumps(data, ensure_ascii=False,
                                             separators=(",", ":")))
+                updated += 1
+    return updated
 
 
 def loudness_reader(out: Path):

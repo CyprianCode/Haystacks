@@ -7,6 +7,7 @@ import re
 
 import pipeline
 import youtube
+from search_data import date_label
 
 
 def hms(t):
@@ -35,7 +36,8 @@ class Library:
 
     def __init__(self, entries):
         """entries: the settings folder entries ({"path", optional "transcripts",
-        "youtube", "links": {stem: YouTube video id}})."""
+        "youtube", "links": {stem: YouTube video id}, "dates": {stem: ISO date
+        set by hand, which wins over any other date}})."""
         self.files = []    # dicts: folder, stem, name, video, youtube, when, label, key, date
         self.segs = []     # (file index, start, text, dB or None), in file order
         self.moments = []  # (file index, time, dB, seg index or -1)
@@ -44,6 +46,13 @@ class Library:
             folder, out, _ = pipeline.entry_dirs(entry)
             data = pipeline.load_folder(folder, out)
             if data:
+                set_dates = entry.get("dates") or {}
+                for f in data[0]:
+                    try:
+                        when = dt.datetime.fromisoformat(set_dates[f[0]])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    f[2], f[3] = when, date_label(when)
                 per.append((entry["path"], data, entry.get("links") or {}))
 
         order = sorted((f[2] is None, f[2] or dt.datetime.min, f[0].lower(), k, lf)

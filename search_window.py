@@ -10,11 +10,11 @@ import threading
 from collections import Counter
 from pathlib import Path
 
-from PySide6.QtCore import (QAbstractListModel, QByteArray, QDate, QEvent, QModelIndex,
-                            QRect, QSize, Qt, QTimer, QUrl, Signal)
+from PySide6.QtCore import (QAbstractListModel, QByteArray, QDate, QDateTime, QEvent,
+                            QModelIndex, QRect, QSize, Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter, QPen, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QComboBox,
-                               QDateEdit, QDialog, QHBoxLayout, QInputDialog, QLabel,
+                               QDateEdit, QDateTimeEdit, QDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListView, QListWidget, QMainWindow, QMenu,
                                QMessageBox,
                                QPushButton, QSplitter, QStackedWidget, QStyle,
@@ -749,6 +749,10 @@ class MainWindow(QMainWindow):
             if linked:
                 menu.addAction("Remove YouTube link", lambda: self.set_link(fi, None))
         menu.addSeparator()
+        if entry is not None:
+            menu.addAction("Change recording date...", lambda: self.change_date(fi))
+            if f["stem"] in entry.get("dates", {}):
+                menu.addAction("Use the video's own date", lambda: self.set_date(fi, None))
         menu.addAction("Hide recording", lambda: self.hide(fi))
         menu.exec(pos)
 
@@ -788,6 +792,50 @@ class MainWindow(QMainWindow):
             links[f["stem"]] = vid
         else:
             links.pop(f["stem"], None)
+        self.save()
+        self.reload(background=True)
+
+    def change_date(self, fi):
+        """Ask for a recording's date, for videos whose camera clock was wrong."""
+        f = self.lib.files[fi]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Change recording date")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 16)
+        note = QLabel(f"When was {f['name']} recorded?\n\nThis date is used for sorting "
+                      "and date filters instead of the one stored in the video.")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        edit = QDateTimeEdit(f["when"] or QDateTime.currentDateTime())
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("yyyy-MM-dd  HH:mm")
+        lay.addWidget(edit)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ok = QPushButton("Change date")
+        ok.setProperty("accent", True)
+        ok.clicked.connect(dlg.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dlg.reject)
+        for b in (ok, cancel):
+            btns.addWidget(b)
+        lay.addLayout(btns)
+        theme.style_window(dlg)
+        if dlg.exec():
+            when = edit.dateTime().toPython().replace(second=0, microsecond=0)
+            self.set_date(fi, when.isoformat(timespec="seconds"))
+
+    def set_date(self, fi, when):
+        """Store (or with None, remove) the date a recording was given by hand."""
+        f = self.lib.files[fi]
+        entry = self.entry_for(f["folder"])
+        if entry is None:
+            return
+        dates = entry.setdefault("dates", {})
+        if when:
+            dates[f["stem"]] = when
+        else:
+            dates.pop(f["stem"], None)
         self.save()
         self.reload(background=True)
 

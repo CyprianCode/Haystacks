@@ -38,6 +38,11 @@ UPDATE_EVERY_S = 24 * 3600
 STATE = "_youtube.json"   # videos that had no subtitles: {id: {"checked", "tries"}}
 RETRY_AFTER_S = 24 * 3600  # automatic captions can take hours to appear
 MAX_TRIES = 3
+# Gentler on YouTube: a pause between yt-dlp's requests for each video's page
+# and player data (about 3 per video), and when YouTube limits requests
+# anyway (HTTP 429), wait this long and go on, at most this many times.
+SLEEP_REQUESTS_S = "1"
+LIMIT_PAUSES_S = (10 * 60, 20 * 60, 40 * 60)
 
 ID = r"[A-Za-z0-9_-]{11}"
 ID_RE = re.compile(rf"\[({ID})\](?:\.[\w-]+)?$")       # "... [id]" or "... [id].en"
@@ -168,7 +173,8 @@ def last_error(lines):
 # ---- listing and fetching --------------------------------------------------------
 def list_videos(url, cancel=None):
     """(name, [(id, title)]) for a video, playlist or channel link."""
-    code, lines = run(["--flat-playlist", "--no-warnings", "--print",
+    code, lines = run(["--flat-playlist", "--no-warnings", "--sleep-requests", SLEEP_REQUESTS_S,
+                       "--print",
                        f"{MARK}%(playlist_title|)s\t%(channel,uploader|)s\t%(id)s\t%(title|)s",
                        url], cancel=cancel)
     videos, name = [], ""
@@ -213,14 +219,26 @@ def files_by_id(folder: Path):
     return out
 
 
+def uploader_has(subs, lang):
+    """Do the uploader's subtitle languages include this one, plain ("en") or
+    regional ("en-US")? Case matters: "en-de" is a translation, not English."""
+    regional = re.compile(rf"{re.escape(lang)}-[A-Z0-9][A-Za-z0-9]*")
+    return any(k == lang or regional.fullmatch(k) for k in subs)
+
+
 def keep_one(files, lang):
-    """When yt-dlp wrote two tracks for a video (e.g. "en" and the uploader's
-    "en-US"), keep the regional one, which is always the uploader's own."""
-    if len(files) < 2:
+    """Keep one subtitle file per video: the uploader's regional track
+    ("en-US"), else the uploader's plain one ("en"), else the automatic
+    captions ("en-orig"), which then gets the plain name."""
+    if not files:
         return
-    files = sorted(files, key=lambda p: (p.stem.endswith("." + lang), p.name))
+    orig = f".{lang}-orig"
+    files = sorted(files, key=lambda p: (p.stem.endswith(orig), p.stem.endswith("." + lang), p.name))
     for extra in files[1:]:
         extra.unlink(missing_ok=True)
+    best = files[0]
+    if best.stem.endswith(orig):
+        best.replace(best.with_name(f"{best.stem[:-len(orig)]}.{lang}{best.suffix}"))
 
 
 def read_state(folder: Path):
@@ -269,7 +287,7 @@ def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
         return 0, waiting, len(videos)
 
     titles = dict(todo)
-    started, errors = [], {}
+    errors, uploader = {}, set()
     halt, limited, ended = threading.Event(), threading.Event(), threading.Event()
 
     def pass_on_stop():  # the user's Stop, or a rate limit, ends yt-dlp
@@ -281,44 +299,106 @@ def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
                 time.sleep(0.2)
     threading.Thread(target=pass_on_stop, daemon=True).start()
 
-    def on_line(line):
-        if line.startswith(MARK):
-            vid = line[len(MARK):].strip()
-            started.append(vid)
-            if on_video:
-                on_video(len(started), titles.get(vid, vid))
-        elif line.startswith("ERROR: "):
-            if "429" in line or "Too Many Requests" in line:
-                limited.set()
-                halt.set()
-                return
-            m = re.search(rf"\b({ID}): (.*)", line)
-            if m:
-                errors[m.group(1)] = m.group(2)
-            else:
-                log("  " + line)
+    pauses = list(LIMIT_PAUSES_S)
 
-    args = ["-a", "-", "--ignore-errors", "--skip-download", "--no-simulate",
-            "--write-subs", "--write-auto-subs", "--sub-langs", sub_langs(lang),
-            "--sub-format", "vtt", "--convert-subs", "vtt", "--sleep-subtitles", "2",
-            "--windows-filenames", "--no-warnings", "--no-progress",
-            "-P", str(folder), "-o", OUT_TEMPLATE, "--print", f"{MARK}%(id)s"]
-    complete = False
+    def subtitles(vids, which, langs, on_start):
+        """Run yt-dlp over vids; (the videos it finished, complete?). When
+        YouTube limits requests, wait and go on with the videos left, up to
+        len(LIMIT_PAUSES_S) times per fetch; after that `limited` stays set."""
+        done = []
+        while True:
+            finished, complete = attempt([v for v in vids if v not in done], which, langs, on_start)
+            done += finished
+            if complete or not limited.is_set() or not pauses or (cancel and cancel.is_set()):
+                return done, complete
+            wait = pauses.pop(0)
+            log(f"YouTube is limiting requests. Waiting {wait // 60} minutes, then going on "
+                f"({len(LIMIT_PAUSES_S) - len(pauses)} of {len(LIMIT_PAUSES_S)})...")
+            if cancel is not None and cancel.wait(wait):
+                return done, False
+            if cancel is None:
+                time.sleep(wait)
+            limited.clear()
+            halt.clear()
+
+    def attempt(vids, which, langs, on_start):
+        """Run yt-dlp once over vids; (the videos it finished, complete?).
+        on_start(id, extra) sees each video's MARK line as it starts. A video
+        is finished once the next one has started (or yt-dlp ended normally).
+        Videos that failed before starting (private, removed) count as finished
+        only after a complete run."""
+        started = []
+
+        def on_line(line):
+            if line.startswith(MARK):
+                vid, _, extra = line[len(MARK):].partition("\t")
+                started.append(vid.strip())
+                on_start(started[-1], extra)
+            elif line.startswith("ERROR: "):
+                if "429" in line or "Too Many Requests" in line:
+                    limited.set()
+                    halt.set()
+                    return
+                m = re.search(rf"\b({ID}): (.*)", line)
+                if m:
+                    errors[m.group(1)] = m.group(2)
+                else:
+                    log("  " + line)
+            elif line.startswith("WARNING: Unable to download"):  # a subtitle failed
+                if "HTTP Error 429" in line or "Too Many Requests" in line:
+                    limited.set()
+                    halt.set()
+                elif started:
+                    errors[started[-1]] = line[len("WARNING: "):]
+
+        args = ["-a", "-", "--ignore-errors", "--skip-download", "--no-simulate",
+                which, "--sub-langs", langs,
+                "--sub-format", "vtt", "--convert-subs", "vtt", "--sleep-subtitles", "2",
+                "--sleep-requests", SLEEP_REQUESTS_S,
+                "--windows-filenames", "--no-progress", "-P", str(folder), "-o", OUT_TEMPLATE,
+                "--print", f"{MARK}%(id)s" + ("\t%(subtitles|{})j" if which == "--write-auto-subs" else "")]
+        try:
+            run(args, on_line, halt, stdin="\n".join(watch_url(v) for v in vids) + "\n")
+        except InterruptedError:
+            return started[:-1], False
+        return started + [v for v in vids if v in errors and v not in started], True
+
+    # Automatic captions: only the original "<lang>-orig" track. yt-dlp's plain
+    # "<lang>" also lists YouTube's machine translations of every other
+    # auto-generated track (on auto-dubbed videos that's one per dub) and may
+    # pick one of those, which YouTube answers with HTTP 429. The run also
+    # reports which languages the uploader has subtitles in.
+    def on_auto(vid, extra):
+        try:
+            if uploader_has(json.loads(extra or "{}") or {}, lang):
+                uploader.add(vid)
+        except ValueError:
+            pass
+        if vid not in seen:  # a video retried after a pause isn't counted twice
+            seen.add(vid)
+            if on_video:
+                on_video(len(seen), titles.get(vid, vid))
+    seen = set()
     try:
-        run(args, on_line, halt, stdin="\n".join(watch_url(v) for v, _ in todo) + "\n")
-        complete = True
-    except InterruptedError:
-        pass
+        finished, complete = subtitles([v for v, _ in todo], "--write-auto-subs",
+                                       re.escape(lang) + "-orig", on_auto)
+        # The uploader's own subtitles, for the videos that have them (preferred
+        # over the automatic ones by keep_one).
+        manual = [v for v in finished if v in uploader]
+        if manual and not halt.is_set():
+            log(f"Fetching the uploader's subtitles for {len(manual)} video"
+                + ("s" if len(manual) > 1 else "") + "...")
+            done, complete = subtitles(manual, "--write-subs", sub_langs(lang), lambda v, e: None)
+            unfinished = set(manual) - set(done)
+        else:
+            unfinished = set(manual)
     finally:
         ended.set()
 
-    # A video is finished once the next one has started (or yt-dlp ended
-    # normally). Videos that failed before starting (private, removed) count
-    # as finished only after a complete run.
-    finished = started if complete else started[:-1]
-    if complete:
-        finished += [v for v, _ in todo if v in errors and v not in started]
     have = files_by_id(folder)
+    # A video waiting for its uploader subtitles is finished anyway if it
+    # already has automatic ones.
+    finished = [v for v in finished if v not in unfinished or v in have]
     new = missing = 0
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     for vid in finished:

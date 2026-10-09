@@ -85,7 +85,8 @@ def collect(transcripts_dir: Path, video_dir: Path, get_loudness, log=print, dat
     dates: {stem: ISO date or None} for transcripts that don't store one.
     Returns (files, segs, moments, undated):
       files   [stem, video Path or None, datetime or None, date label or None],
-              oldest first, undated last
+              oldest first, undated last (the video file's date is used when
+              there is no other; only transcripts without a video are undated)
       segs    [file index, start, text, loudest dB or None], in file order
       moments [file index, time, dB, seg index or -1]
     """
@@ -105,6 +106,14 @@ def collect(transcripts_dir: Path, video_dir: Path, get_loudness, log=print, dat
         if "created" not in data and dates:
             data["created"] = dates.get(stem)
         when, label = recording_date(data, stem)
+        video = videos.get(stem.lower())
+        if when is None and video:  # no date anywhere: the file's own date
+            try:
+                st = video.stat()
+                when = dt.datetime.fromtimestamp(min(st.st_ctime, st.st_mtime))
+                label = date_label(when)
+            except OSError:
+                pass
         records.append((when, label, stem, data))
 
     # Sort oldest to newest; files without a date go last.
