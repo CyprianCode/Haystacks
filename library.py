@@ -4,6 +4,7 @@ it can be tested on its own.
 """
 import datetime as dt
 import re
+from collections import Counter
 
 import pipeline
 import youtube
@@ -85,6 +86,7 @@ class Library:
                 self.moments.append((new_fi[k, lf], t, db,
                                      new_si.get((k, si), -1) if si >= 0 else -1))
         self.norm = [s[2].lower() for s in self.segs]
+        self.seg_count = Counter(s[0] for s in self.segs)  # sentences per file index
 
     def allowed(self, hidden=(), folder=None, date_from=None, date_to=None):
         """File indexes not hidden, in the folder (None: all) and the date range

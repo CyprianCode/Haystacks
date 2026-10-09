@@ -11,14 +11,14 @@ from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QByteArray, QDate, QDateTime, QEvent,
-                            QModelIndex, QRect, QSize, Qt, QTimer, QUrl, Signal)
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter, QPen, QShortcut, QTextDocument
+                            QModelIndex, QPointF, QRect, QSize, Qt, QTimer, QUrl, Signal)
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QKeySequence, QMouseEvent, QPainter, QPen, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QComboBox,
                                QDateEdit, QDateTimeEdit, QDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListView, QListWidget, QMainWindow, QMenu,
                                QMessageBox,
                                QPushButton, QSplitter, QStackedWidget, QStyle,
-                               QStyledItemDelegate, QVBoxLayout, QWidget)
+                               QStyledItemDelegate, QStyleOptionComboBox, QVBoxLayout, QWidget)
 
 import pipeline
 import theme
@@ -350,6 +350,53 @@ class ResultsView(QListView):
         return row[1][0]
 
 
+# ---- date filter -------------------------------------------------------------
+class DateBox(QDateEdit):
+    """Date filter, "Any" = NO_DATE. A click anywhere opens the calendar (on
+    this month when empty), and stepping from "Any" starts at today, not 1990."""
+
+    def __init__(self):
+        super().__init__()
+        self.setCalendarPopup(True)
+        self.setDisplayFormat("yyyy-MM-dd")
+        self.setMinimumDate(NO_DATE)
+        self.setSpecialValueText("Any")
+        self.setDate(NO_DATE)
+        self.setFixedWidth(118)
+        self.lineEdit().installEventFilter(self)
+        self.calendarWidget().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if (obj is self.lineEdit() and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton):
+            self.open_calendar()
+            return True
+        if obj is self.calendarWidget() and event.type() == QEvent.Show \
+                and self.date() == NO_DATE:
+            today = QDate.currentDate()
+            obj.setCurrentPage(today.year(), today.month())
+        return False
+
+    def open_calendar(self):
+        # Qt opens the popup when a press lands on the drop-down arrow
+        opt = QStyleOptionComboBox()
+        opt.initFrom(self)
+        opt.editable = True
+        opt.subControls = QStyle.SC_All
+        arrow = self.style().subControlRect(QStyle.CC_ComboBox, opt,
+                                            QStyle.SC_ComboBoxArrow, self)
+        pos = QPointF(arrow.center())
+        self.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos,
+                                         self.mapToGlobal(pos), Qt.LeftButton,
+                                         Qt.LeftButton, Qt.NoModifier))
+
+    def stepBy(self, steps):
+        if self.date() == NO_DATE:
+            self.setDate(QDate.currentDate())
+        else:
+            super().stepBy(steps)
+
+
 # ---- main window -------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, settings, save, make_transcriber):
@@ -510,26 +557,9 @@ class MainWindow(QMainWindow):
 
     # ---- widgets ---------------------------------------------------------------
     def date_edit(self):
-        d = QDateEdit()
-        d.setCalendarPopup(True)
-        d.setDisplayFormat("yyyy-MM-dd")
-        d.setMinimumDate(NO_DATE)
-        d.setSpecialValueText("Any")
-        d.setDate(NO_DATE)
-        d.setFixedWidth(118)
+        d = DateBox()
         d.dateChanged.connect(lambda _: self.run())
-        cal = d.calendarWidget()
-        cal.installEventFilter(self)  # open the calendar on this month, not 1990
-        d._cal = cal
         return d
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Show:
-            for d in (self.date_from, self.date_to):
-                if obj is d._cal and d.date() == NO_DATE:
-                    today = QDate.currentDate()
-                    obj.setCurrentPage(today.year(), today.month())
-        return False
 
     @staticmethod
     def date_value(d):
@@ -649,7 +679,7 @@ class MainWindow(QMainWindow):
         self.results.terms = terms
         if not terms or len("".join(terms)) < 2:
             self.status.setText(f"{len(ok)} of {len(lib.files)} recordings in range, "
-                                f"{len(lib.segs):,} sentences to search.")
+                                f"{sum(lib.seg_count[fi] for fi in ok):,} sentences to search.")
             return self.show_message("Type above to search what was said.")
         sort = SORTS[self.sort_box.currentText()]
         hits = lib.search(terms, ok, sort)
