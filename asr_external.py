@@ -21,7 +21,7 @@ NO_WINDOW = 0x08000000
 OUTPUT_EXTS = (".json", ".srt", ".vtt")
 
 
-class _Job:
+class Job:
     """A job object with kill-on-close: processes added to it end when this
     process ends (or close() is called)."""
     def __init__(self):
@@ -84,7 +84,7 @@ class _Job:
 class _External:
     """Shared part: run a program, then read the transcript it wrote."""
     def __init__(self):
-        self.job = _Job()
+        self.job = Job()
 
     def __enter__(self):
         return self

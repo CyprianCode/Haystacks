@@ -124,11 +124,11 @@ QPushButton[accent="true"]:disabled {{ background: {c['button_off']};
 QPushButton[tab="true"]:checked {{ background: {c['accent_dim']}; border-color: {c['accent']}; }}
 QPushButton[icon="true"] {{ padding: 5px 8px; }}
 
-QLineEdit, QComboBox, QDateEdit {{ background: {c['field']}; border: 1px solid {c['button_border']};
+QLineEdit, QComboBox, QDateTimeEdit {{ background: {c['field']}; border: 1px solid {c['button_border']};
   border-radius: 4px; padding: 5px 8px; selection-background-color: {c['accent_dim']};
   selection-color: {c['ink']}; }}
-QLineEdit:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {c['accent']}; }}
-QLineEdit:disabled, QComboBox:disabled, QDateEdit:disabled {{ background: {c['panel']};
+QLineEdit:focus, QComboBox:focus, QDateTimeEdit:focus {{ border-color: {c['accent']}; }}
+QLineEdit:disabled, QComboBox:disabled, QDateTimeEdit:disabled {{ background: {c['panel']};
   color: {c['button_off_ink']}; border-color: {c['button_off_border']}; }}
 QLineEdit#search {{ font-size: 15pt; padding: 8px 12px; }}
 QComboBox QAbstractItemView {{ background: {c['field']}; border: 1px solid {c['line']};

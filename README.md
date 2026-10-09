@@ -8,6 +8,11 @@ moment in a built-in player. Nothing is uploaded anywhere; transcription runs
 locally with the [Orukeet](https://github.com/Oruk-AI/orukeet) speech
 recognition engine, or a Whisper model if you prefer.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/search-dark.png">
+  <img alt="Searching for &quot;camera&quot;: matching sentences grouped by recording, with the video playing at the selected moment" src="docs/screenshots/search-light.png">
+</picture>
+
 ## Features
 
 - **Transcribe folders of videos.** Add a folder, pick which audio track to
@@ -26,10 +31,30 @@ recognition engine, or a Whisper model if you prefer.
   Whisper JSON (openai-whisper, faster-whisper, whisper.cpp), and `.srt` /
   `.vtt` subtitles named like the videos (`clip.srt` or `clip.en.srt` for
   `clip.mp4`). Imported files are read in place and never changed.
+- **Search YouTube videos** by what is said in them. Paste a link to a video,
+  playlist or channel under **Add videos > Add YouTube...** and Haystacks
+  fetches the subtitles YouTube already has (the uploader's own, or else
+  YouTube's automatic captions; a few KB per video), or transcribes the videos
+  itself with your speech engine. Results play in the built-in player, with
+  the same controls. See
+  [YouTube videos](#youtube-videos).
+- **Link your own transcripts to YouTube.** Have a transcript of a video
+  that's on YouTube? **Add videos > Link to YouTube...** pairs the file with
+  the video's link, and its results play the YouTube video.
 - **Updates itself.** When a new version is out, a banner offers to install
   it with one click.
 - Video formats: `.mp4`, `.mkv`, `.mov`, `.avi`, `.mts`, `.m4v`, `.webm`.
 - Light and dark theme, following your Windows setting.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/add-videos-dark.png">
+  <img alt="The Add videos window during a run: folders, progress bars, time remaining and speed" src="docs/screenshots/add-videos-light.png" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/loudest-dark.png">
+  <img alt="Loudest moments: the loudest moments across all recordings, with what was said at the time" src="docs/screenshots/loudest-light.png">
+</picture>
 
 ## Install
 
@@ -82,20 +107,73 @@ Switching models doesn't change videos that are already transcribed; use
 Requirements: 64-bit Windows 10 or 11. Searching imported transcripts works
 without the speech engine.
 
+### YouTube videos
+
+**Add videos > Add YouTube...** takes a link to a single video, a playlist or a
+channel. Haystacks downloads [yt-dlp](https://github.com/yt-dlp/yt-dlp) the
+first time (about 18 MB, kept up to date automatically). Choose where the text
+comes from:
+
+- **YouTube's subtitles:** one subtitle file per video, in the language you
+  choose. Quick, and nothing else is downloaded.
+- **YouTube's subtitles, and transcribe the videos that have none.**
+- **Transcribe every video here:** each video's audio is downloaded (about
+  1 MB per minute of video), transcribed with your speech engine like your own
+  videos, and deleted right after. Slower, but usually more accurate than
+  automatic captions, and it works for videos with no subtitles at all.
+
+Select the YouTube entry and press **Get new subtitles** / **Get new videos**
+(or **Transcribe all folders**) at any time to add new uploads; videos already
+done are skipped.
+
+- Videos without subtitles in that language are skipped and tried again on
+  later runs (automatic captions can take a few hours to appear after upload).
+  A video that can't be downloaded or transcribed is tried again the next day,
+  up to three times.
+- Automatic captions have more mistakes than the speech engine, and sometimes
+  no punctuation.
+- Playing needs an internet connection. A few videos can't be played outside
+  YouTube by their owner's choice; right-click a result and choose **Open on
+  YouTube** to watch it there, at the same moment.
+- YouTube limits how fast subtitles and audio can be fetched. For a big
+  channel it may stop partway with a message; what was fetched is kept, and
+  running it again later continues.
+- Only transcribed YouTube videos have loudness data, so videos searched by
+  their subtitles don't appear in Loudest moments.
+
+**Transcripts you already have:** **Add videos > Link to YouTube...** takes a
+transcript file (Haystacks or Whisper JSON, `.srt` or `.vtt`) and the link to
+the video on YouTube. The file is read where it is and never changed; its
+folder is added to the list like imported transcripts. You can also
+right-click any result and choose **Link to YouTube video...** (or **Change**
+/ **Remove YouTube link**). If the video file is also on your PC, results
+still play it from there, and **Open on YouTube** is in the right-click menu.
+Transcript files named like yt-dlp's (`<title> [<video id>].en.vtt`) are
+linked automatically when imported. The transcript's timings must match the
+uploaded video: a transcript of a longer or edited recording will be off.
+
 ## Where things are stored
 
 - **Transcripts** for each folder go in a `_Haystacks` folder inside it:
   `<stem>.json` per video, plus `_loudness\` (loudness data) and
   `_failed.txt` (if a video couldn't be transcribed). No audio files are
   kept; audio is decoded from the video into memory.
+- **YouTube subtitles and transcripts** go in
+  `%LOCALAPPDATA%\Haystacks\YouTube\<name>` (or the folder you chose): one
+  file per video, `<upload date> <title> [<video id>].<language>.vtt` for
+  subtitles or `<upload date> <title> [<video id>].json` for a transcribed
+  video (with `_loudness\`), plus `_youtube.json` (videos that had no
+  subtitles or failed to transcribe). Downloaded audio waits in
+  `%TEMP%\Haystacks-yt` only until it is transcribed.
 - **Settings** (folder list, hidden recordings, window layout):
   `%APPDATA%\Haystacks\settings.json`.
 - **The app** is installed in `%LOCALAPPDATA%\Programs\Haystacks`.
-- **The speech engine** is stored in `%LOCALAPPDATA%\Haystacks\engine`.
+- **The speech engine** is stored in `%LOCALAPPDATA%\Haystacks\engine`, and
+  yt-dlp in `%LOCALAPPDATA%\Haystacks\engine\yt-dlp`.
 - "Clear finished videos..." in Add videos deletes only the files Haystacks
   wrote in `_Haystacks`, never your videos.
-- Uninstalling (Windows Settings > Apps) removes the app and the speech
-  engine; your videos, transcripts and settings stay.
+- Uninstalling (Windows Settings > Apps) removes the app, the speech engine
+  and yt-dlp; your videos, transcripts, YouTube subtitles and settings stay.
 
 ## Run from source
 
@@ -146,7 +224,9 @@ desktop shortcut to the source version.
 | `Haystacks.pyw` | Entry point: settings, theme, crash dialog. |
 | `search_window.py` | Main window: search, filters, results list, Loudest moments. |
 | `player.py` | Built-in video player panel. |
-| `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing. |
+| `youtube.py` | Fetching YouTube subtitles and audio with yt-dlp. |
+| `youtube_view.py` | Playing YouTube videos in the player panel (Qt WebEngine). |
+| `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing, adding YouTube videos. |
 | `engine.py`, `engine_dialog.py` | Choosing, downloading and testing the speech model and engine. |
 | `asr_external.py` | Runs whisper.cpp or a custom command as the speech engine. |
 | `updater.py`, `update_banner.py` | Checking GitHub for new versions and installing them. |
@@ -160,6 +240,7 @@ desktop shortcut to the source version.
 | `haystacks.spec`, `installer.iss`, `build.ps1` | Building the app and its installer. |
 | `tools/third_party.py` | Writes the license notices bundled with the installer. |
 | `assets/` | The app icon and the script that draws it. |
+| `docs/screenshots/` | Screenshots for this README (light and dark), taken with made-up demo recordings. |
 
 ## License
 
@@ -167,7 +248,8 @@ Haystacks is free software, licensed under the
 [GNU General Public License v3.0](LICENSE).
 
 The installer includes Python, [PySide6 / Qt](https://www.qt.io/qt-for-python)
-(LGPL-3.0), [NumPy](https://numpy.org) (BSD-3-Clause),
+(LGPL-3.0) including Qt WebEngine (Chromium, BSD-3-Clause and others),
+[NumPy](https://numpy.org) (BSD-3-Clause),
 [PyAV](https://pyav.org) (BSD-3-Clause) with [FFmpeg](https://ffmpeg.org)
 (LGPL-2.1-or-later), and [Orukeet](https://github.com/Oruk-AI/orukeet)'s
 Python package (MIT). Their full license texts are in
@@ -177,3 +259,5 @@ The Orukeet speech model is downloaded on first use and is licensed
 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). It is based
 on NVIDIA Parakeet TDT 0.6B v3. The optional Whisper models, Distil-Whisper
 and whisper.cpp are downloaded only if chosen, and are licensed MIT.
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) is downloaded only when YouTube
+videos are added, and is released under the Unlicense.

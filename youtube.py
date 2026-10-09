@@ -1,0 +1,575 @@
+"""
+YouTube videos as a source of transcripts, fetched with yt-dlp and searched
+like any imported transcripts. Where the text comes from is the entry's
+"source":
+    "subtitles"   the subtitles YouTube already has (the uploader's, else its
+                  automatic captions), one WebVTT file per video (the default)
+    "fill"        those subtitles, and the videos without any are transcribed
+    "transcribe"  every video is transcribed with the chosen speech engine
+To transcribe, only the audio is downloaded (download_audio), into a temporary
+folder, and deleted once the transcript is written. Videos always play from
+YouTube.
+
+A YouTube source is a folder entry
+    {"path": D, "transcripts": D, "youtube": <url>, "lang": "en", "source": ..., ...}
+where D holds "<upload date> <title> [<video id>].<lang>.vtt" or, for
+transcribed videos, "<upload date> <title> [<video id>].json" (app JSON, with
+loudness in D\\_loudness). The date at the front is the recording date search
+uses (search_data.parse_date); the id at the end is what the player plays.
+
+yt-dlp itself is downloaded on first use into the engine folder (so the
+uninstaller removes it) and updated at most once a day, since YouTube changes
+often break older versions.
+"""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import paths
+import pipeline
+import transcripts
+import updater
+from asr_external import NO_WINDOW, Job
+from search_data import parse_date, write_atomic
+
+TOOL_DIR = paths.ENGINE / "yt-dlp"
+EXE = TOOL_DIR / "yt-dlp.exe"
+STAMP = TOOL_DIR / "_updated"
+RELEASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/"
+UPDATE_EVERY_S = 24 * 3600
+STATE = "_youtube.json"   # videos that had no subtitles: {id: {"checked", "tries"}}
+FAILED_DOWNLOADS = "_download"  # key in STATE: {id: {"checked", "tries"}} of videos that failed to download or transcribe
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "Haystacks-yt"  # audio waiting to be transcribed
+SOURCES = ("subtitles", "fill", "transcribe")
+RETRY_AFTER_S = 24 * 3600  # automatic captions can take hours to appear
+MAX_TRIES = 3
+# Gentler on YouTube: a pause between yt-dlp's requests for each video's page
+# and player data (about 3 per video), and when YouTube limits requests
+# anyway (HTTP 429), wait this long and go on, at most this many times.
+SLEEP_REQUESTS_S = "1"
+LIMIT_PAUSES_S = (10 * 60, 20 * 60, 40 * 60)
+
+ID = r"[A-Za-z0-9_-]{11}"
+ID_RE = re.compile(rf"\[({ID})\](?:\.[\w-]+)?$")       # "... [id]" or "... [id].en"
+NAME_RE = re.compile(rf"^(?:\d{{4}}-\d\d-\d\d |NA )?(.*?) ?\[{ID}\](?:\.[\w-]+)?$")
+TAB_SUFFIX = re.compile(r" - (Videos|Shorts|Live|Streams|Home)$")
+OUT_TEMPLATE = "%(upload_date>%Y-%m-%d)s %(title).120B [%(id)s].%(ext)s"
+MARK = "@@video "
+FILE_MARK = "@@file "
+# yt-dlp's stand-ins for characters Windows doesn't allow in file names.
+UNSAFE = str.maketrans({"\uff1f": "?", "\uff1a": ":", "\u29f8": "/", "\u29f9": "\\",
+                        "\uff02": '"', "\uff0a": "*", "\uff1c": "<", "\uff1e": ">",
+                        "\uff5c": "|"})
+
+
+class Limited(RuntimeError):
+    """YouTube is limiting requests (HTTP 429) and the waits are used up."""
+
+
+def source(entry):
+    """Where a YouTube entry's text comes from (see SOURCES)."""
+    return entry.get("source") if entry.get("source") in SOURCES else "subtitles"
+
+
+def is_limited(lines):
+    return any("429" in l or "Too Many Requests" in l
+               for l in lines if l.startswith(("ERROR: ", "WARNING: ")))
+
+
+def limit_pause(pauses, log, cancel):
+    """YouTube is limiting requests: wait the next pause in `pauses` (a list
+    made from LIMIT_PAUSES_S, used up over a whole run). False if none are
+    left, or Stop was pressed while waiting."""
+    if not pauses or (cancel is not None and cancel.is_set()):
+        return False
+    wait = pauses.pop(0)
+    log(f"YouTube is limiting requests. Waiting {wait // 60} minutes, then going on "
+        f"({len(LIMIT_PAUSES_S) - len(pauses)} of {len(LIMIT_PAUSES_S)})...")
+    if cancel is not None:
+        return not cancel.wait(wait)
+    time.sleep(wait)
+    return True
+
+
+def video_id(stem):
+    """The YouTube id at the end of a subtitle file's name, or None."""
+    m = ID_RE.search(stem)
+    return m.group(1) if m else None
+
+
+def title(stem):
+    """The video title from a subtitle file's name (no date, id or language)."""
+    m = NAME_RE.match(stem)
+    return ((m.group(1) if m else stem) or stem).translate(UNSAFE)
+
+
+def parse_url(text):
+    """The video id in a YouTube link (watch, youtu.be, shorts, live, embed)
+    or a bare id, or None."""
+    text = text.strip()
+    if re.fullmatch(ID, text):
+        return text
+    m = re.search(rf"(?:[?&]v=|youtu\.be/|/shorts/|/live/|/embed/)({ID})(?![\w-])", text)
+    return m.group(1) if m else None
+
+
+def watch_url(vid, seconds=0):
+    return f"https://www.youtube.com/watch?v={vid}" + (f"&t={int(seconds)}s" if seconds else "")
+
+
+def sub_langs(lang):
+    """yt-dlp --sub-langs for one language: the plain code, plus the uploader's
+    regional versions (en-US, pt-BR, zh-Hans). yt-dlp matches without regard to
+    case, so the inline (?-i:) keeps out translated tracks like "en-de"."""
+    lang = re.escape(lang)
+    return f"{lang},(?-i:{lang}-[A-Z0-9][A-Za-z0-9]*)"
+
+
+# ---- the yt-dlp program ---------------------------------------------------------
+def ensure_tool(log=print, cancel=None):
+    """Download yt-dlp if it isn't there; otherwise update it once a day."""
+    TOOL_DIR.mkdir(parents=True, exist_ok=True)
+    if not EXE.exists():
+        log("Downloading yt-dlp (fetches YouTube subtitles)...")
+        sums = updater._get(RELEASE + "SHA2-256SUMS").read().decode("utf-8", "replace")
+        sha = next((line.split()[0] for line in sums.splitlines()
+                    if line.split() and line.split()[-1].lstrip("*") == EXE.name), None)
+        if not sha:
+            raise RuntimeError("yt-dlp's release has no checksum, so it can't be verified")
+        updater.fetch_file(RELEASE + EXE.name, EXE, sha, cancel=cancel)
+        STAMP.touch()
+        return
+    try:
+        fresh = time.time() - STAMP.stat().st_mtime < UPDATE_EVERY_S
+    except OSError:
+        fresh = False
+    if not fresh:
+        log("Checking for a newer yt-dlp...")
+        code, lines = run(["-U"], cancel=cancel)
+        updated = [l for l in lines if l.startswith("Updated yt-dlp")]
+        if updated:
+            log(updated[-1])
+        elif code:
+            log("Could not update yt-dlp: " + (lines[-1] if lines else f"code {code}"))
+        STAMP.touch()
+
+
+def run(args, on_line=None, cancel=None, stdin=None):
+    """Run yt-dlp; (exit code, output lines). on_line(line) sees each line as
+    it comes. Setting `cancel` ends yt-dlp right away (InterruptedError)."""
+    job = Job()
+    try:
+        proc = subprocess.Popen([str(EXE), "--ignore-config", "--encoding", "utf-8", *args],
+                                stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                creationflags=NO_WINDOW)
+    except FileNotFoundError:
+        raise RuntimeError("yt-dlp is missing; try again to download it") from None
+    job.add(proc)
+    if stdin:
+        proc.stdin.write(stdin.encode("utf-8"))
+        proc.stdin.close()
+    stopped = threading.Event()
+
+    def watch():
+        while proc.poll() is None:
+            if cancel is not None and cancel.wait(0.2):
+                stopped.set()
+                # yt-dlp.exe unpacks itself and runs the real program as a child
+                # process, so end the whole tree, not just the first process.
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=NO_WINDOW)
+                job.close()
+                return
+            if cancel is None:
+                time.sleep(0.2)
+    threading.Thread(target=watch, daemon=True).start()
+
+    lines = []
+    for raw in proc.stdout:
+        line = raw.decode("utf-8", "replace").rstrip()
+        if line:
+            lines.append(line)
+            if on_line:
+                on_line(line)
+    code = proc.wait()
+    job.close()
+    if stopped.is_set():
+        raise InterruptedError("stopped")
+    return code, lines
+
+
+def last_error(lines):
+    errors = [l[len("ERROR: "):] for l in lines if l.startswith("ERROR: ")]
+    return errors[-1] if errors else (lines[-1] if lines else "no output")
+
+
+# ---- listing and fetching --------------------------------------------------------
+def list_videos(url, cancel=None):
+    """(name, [(id, title, length in seconds or None)]) for a video, playlist
+    or channel link."""
+    code, lines = run(["--flat-playlist", "--no-warnings", "--sleep-requests", SLEEP_REQUESTS_S,
+                       "--print", f"{MARK}%(playlist_title|)s\t%(channel,uploader|)s\t%(id)s"
+                                  f"\t%(duration|)s\t%(title|)s",
+                       url], cancel=cancel)
+    videos, name = [], ""
+    for line in lines:
+        if not line.startswith(MARK):
+            continue
+        parts = line[len(MARK):].split("\t")
+        if len(parts) < 5 or not re.fullmatch(ID, parts[2]):
+            continue
+        playlist, channel, vid, vtitle = parts[0], parts[1], parts[2], "\t".join(parts[4:])
+        try:
+            length = float(parts[3]) or None
+        except ValueError:
+            length = None
+        if not name:
+            name = TAB_SUFFIX.sub("", playlist) or channel or vtitle
+        if all(v[0] != vid for v in videos):
+            videos.append((vid, vtitle, length))
+    if not videos:
+        raise RuntimeError(f"no videos found at that link ({last_error(lines)})"
+                           if code else "no videos found at that link")
+    return name, videos
+
+
+def video_info(vid, cancel=None):
+    """(title, upload date as "YYYY-MM-DD" or None) of one video. Raises
+    RuntimeError if YouTube doesn't know it."""
+    code, lines = run(["--skip-download", "--no-warnings", "--print",
+                       f"{MARK}%(upload_date>%Y-%m-%d|)s\t%(title|)s", watch_url(vid)],
+                      cancel=cancel)
+    for line in lines:
+        if line.startswith(MARK):
+            date, _, vtitle = line[len(MARK):].partition("\t")
+            return vtitle, date or None
+    raise RuntimeError(last_error(lines))
+
+
+def files_by_id(folder: Path):
+    """{video id: [transcript files]} in a YouTube folder: subtitles, and
+    transcripts of videos transcribed here."""
+    out = {}
+    if folder.is_dir():
+        for p in folder.iterdir():
+            vid = video_id(p.stem) if p.suffix.lower() in transcripts.EXTS else None
+            if vid:
+                out.setdefault(vid, []).append(p)
+    return out
+
+
+def uploader_has(subs, lang):
+    """Do the uploader's subtitle languages include this one, plain ("en") or
+    regional ("en-US")? Case matters: "en-de" is a translation, not English."""
+    regional = re.compile(rf"{re.escape(lang)}-[A-Z0-9][A-Za-z0-9]*")
+    return any(k == lang or regional.fullmatch(k) for k in subs)
+
+
+def keep_one(files, lang):
+    """Keep one subtitle file per video: the uploader's regional track
+    ("en-US"), else the uploader's plain one ("en"), else the automatic
+    captions ("en-orig"), which then gets the plain name."""
+    files = [p for p in files if p.suffix.lower() == ".vtt"]
+    if not files:
+        return
+    orig = f".{lang}-orig"
+    files = sorted(files, key=lambda p: (p.stem.endswith(orig), p.stem.endswith("." + lang), p.name))
+    for extra in files[1:]:
+        extra.unlink(missing_ok=True)
+    best = files[0]
+    if best.stem.endswith(orig):
+        best.replace(best.with_name(f"{best.stem[:-len(orig)]}.{lang}{best.suffix}"))
+
+
+def read_state(folder: Path):
+    try:
+        return json.loads((folder / STATE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def due(info, now):
+    """Should a video that had no subtitles be tried again?"""
+    try:
+        checked = dt.datetime.fromisoformat(info["checked"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return True
+    return info.get("tries", 1) < MAX_TRIES and now - checked >= RETRY_AFTER_S
+
+
+def count(entry):
+    """Number of videos with subtitles or a transcript in a YouTube folder entry."""
+    return len(files_by_id(Path(entry["transcripts"])))
+
+
+def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
+    """Fetch subtitles for every video at entry["youtube"] that doesn't have
+    them yet. on_plan(n) once the work is known; on_video(i, title) as each
+    video starts. Returns (new subtitle files, videos without subtitles,
+    [(id, title, length)] of every video at the link). Safe to stop and run
+    again: finished videos (subtitles or a transcript) are skipped."""
+    folder = Path(entry["transcripts"])
+    lang = entry.get("lang") or "en"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    name, videos = list_videos(entry["youtube"], cancel)
+    have = files_by_id(folder)
+    state = read_state(folder)
+    now = time.time()
+    todo = [(v, t) for v, t, _ in videos
+            if v not in have and (v not in state or due(state[v], now))]
+    waiting = sum(1 for v, *_ in videos if v not in have and v in state and not due(state[v], now))
+    log(f"{name}: {len(videos)} videos, {len(videos) - len(todo) - waiting} have subtitles, "
+        f"{len(todo)} to fetch" + (f", {waiting} without subtitles (checked recently)"
+                                   if waiting else "") + ".")
+    if on_plan:
+        on_plan(len(todo))
+    if not todo:
+        return 0, waiting, videos
+
+    titles = dict(todo)
+    errors, uploader = {}, set()
+    halt, limited, ended = threading.Event(), threading.Event(), threading.Event()
+
+    def pass_on_stop():  # the user's Stop, or a rate limit, ends yt-dlp
+        while not ended.is_set():
+            if cancel is not None and cancel.wait(0.2):
+                halt.set()
+                return
+            if cancel is None:
+                time.sleep(0.2)
+    threading.Thread(target=pass_on_stop, daemon=True).start()
+
+    pauses = list(LIMIT_PAUSES_S)
+
+    def subtitles(vids, which, langs, on_start):
+        """Run yt-dlp over vids; (the videos it finished, complete?). When
+        YouTube limits requests, wait and go on with the videos left, up to
+        len(LIMIT_PAUSES_S) times per fetch; after that `limited` stays set."""
+        done = []
+        while True:
+            finished, complete = attempt([v for v in vids if v not in done], which, langs, on_start)
+            done += finished
+            if complete or not limited.is_set():
+                return done, complete
+            if not limit_pause(pauses, log, cancel):
+                return done, False
+            limited.clear()
+            halt.clear()
+
+    def attempt(vids, which, langs, on_start):
+        """Run yt-dlp once over vids; (the videos it finished, complete?).
+        on_start(id, extra) sees each video's MARK line as it starts. A video
+        is finished once the next one has started (or yt-dlp ended normally).
+        Videos that failed before starting (private, removed) count as finished
+        only after a complete run."""
+        started = []
+
+        def on_line(line):
+            if line.startswith(MARK):
+                vid, _, extra = line[len(MARK):].partition("\t")
+                started.append(vid.strip())
+                on_start(started[-1], extra)
+            elif line.startswith("ERROR: "):
+                if "429" in line or "Too Many Requests" in line:
+                    limited.set()
+                    halt.set()
+                    return
+                m = re.search(rf"\b({ID}): (.*)", line)
+                if m:
+                    errors[m.group(1)] = m.group(2)
+                else:
+                    log("  " + line)
+            elif line.startswith("WARNING: Unable to download"):  # a subtitle failed
+                if "HTTP Error 429" in line or "Too Many Requests" in line:
+                    limited.set()
+                    halt.set()
+                elif started:
+                    errors[started[-1]] = line[len("WARNING: "):]
+
+        args = ["-a", "-", "--ignore-errors", "--skip-download", "--no-simulate",
+                which, "--sub-langs", langs,
+                "--sub-format", "vtt", "--convert-subs", "vtt", "--sleep-subtitles", "2",
+                "--sleep-requests", SLEEP_REQUESTS_S,
+                "--windows-filenames", "--no-progress", "-P", str(folder), "-o", OUT_TEMPLATE,
+                "--print", f"{MARK}%(id)s" + ("\t%(subtitles|{})j" if which == "--write-auto-subs" else "")]
+        try:
+            run(args, on_line, halt, stdin="\n".join(watch_url(v) for v in vids) + "\n")
+        except InterruptedError:
+            return started[:-1], False
+        return started + [v for v in vids if v in errors and v not in started], True
+
+    # Automatic captions: only the original "<lang>-orig" track. yt-dlp's plain
+    # "<lang>" also lists YouTube's machine translations of every other
+    # auto-generated track (on auto-dubbed videos that's one per dub) and may
+    # pick one of those, which YouTube answers with HTTP 429. The run also
+    # reports which languages the uploader has subtitles in.
+    def on_auto(vid, extra):
+        try:
+            if uploader_has(json.loads(extra or "{}") or {}, lang):
+                uploader.add(vid)
+        except ValueError:
+            pass
+        if vid not in seen:  # a video retried after a pause isn't counted twice
+            seen.add(vid)
+            if on_video:
+                on_video(len(seen), titles.get(vid, vid))
+    seen = set()
+    try:
+        finished, complete = subtitles([v for v, _ in todo], "--write-auto-subs",
+                                       re.escape(lang) + "-orig", on_auto)
+        # The uploader's own subtitles, for the videos that have them (preferred
+        # over the automatic ones by keep_one).
+        manual = [v for v in finished if v in uploader]
+        if manual and not halt.is_set():
+            log(f"Fetching the uploader's subtitles for {len(manual)} video"
+                + ("s" if len(manual) > 1 else "") + "...")
+            done, complete = subtitles(manual, "--write-subs", sub_langs(lang), lambda v, e: None)
+            unfinished = set(manual) - set(done)
+        else:
+            unfinished = set(manual)
+    finally:
+        ended.set()
+
+    have = files_by_id(folder)
+    # A video waiting for its uploader subtitles is finished anyway if it
+    # already has automatic ones.
+    finished = [v for v in finished if v not in unfinished or v in have]
+    new = missing = 0
+    stamp = dt.datetime.now().isoformat(timespec="seconds")
+    for vid in finished:
+        if vid in have:
+            keep_one(have[vid], lang)
+            state.pop(vid, None)
+            new += 1
+        else:
+            reason = errors.get(vid)
+            log(f"  No {lang} subtitles: {titles.get(vid, vid)}" + (f" ({reason})" if reason else ""))
+            tries = state.get(vid, {}).get("tries", 0) + 1
+            state[vid] = {"checked": stamp, "tries": tries}
+            missing += 1
+    if finished or (folder / STATE).exists():
+        write_atomic(folder / STATE, json.dumps(state, indent=1))
+    if limited.is_set():
+        log("YouTube is limiting requests right now. What was fetched is kept; "
+            "try again later to get the rest.")
+    elif not complete:
+        raise InterruptedError("stopped")
+    return new, missing + waiting, videos
+
+
+# ---- transcribing locally ----------------------------------------------------------
+def to_transcribe(entry, videos):
+    """The videos ([(id, title, length)]) of a YouTube folder entry still to
+    download and transcribe: nothing to search for them yet (no subtitles, no
+    transcript), and no failed try recently (see due, note_try)."""
+    folder = Path(entry["transcripts"])
+    have = files_by_id(folder)
+    failed = read_state(folder).get(FAILED_DOWNLOADS) or {}
+    now = time.time()
+    return [v for v in videos if v[0] not in have and (v[0] not in failed or due(failed[v[0]], now))]
+
+
+def note_try(entry, vid, ok):
+    """Remember a video whose audio download or transcription failed (tried
+    again after a day, up to MAX_TRIES times), or forget it once one works."""
+    folder = Path(entry["transcripts"])
+    state = read_state(folder)
+    failed = state.setdefault(FAILED_DOWNLOADS, {})
+    if ok:
+        if failed.pop(vid, None) is None:
+            return
+    else:
+        failed[vid] = {"checked": dt.datetime.now().isoformat(timespec="seconds"),
+                       "tries": failed.get(vid, {}).get("tries", 0) + 1}
+    if not failed:
+        del state[FAILED_DOWNLOADS]
+    folder.mkdir(parents=True, exist_ok=True)
+    write_atomic(folder / STATE, json.dumps(state, indent=1))
+
+
+def download_audio(vid, log=print, cancel=None, pauses=None):
+    """Download one video's audio (no picture) into DOWNLOAD_DIR, named like
+    its subtitles would be ("<date> <title> [id].webm"), so the transcript
+    gets the same name. Returns its Path; the caller deletes it. Raises
+    InterruptedError on Stop, Limited when YouTube keeps limiting requests
+    after the waits in `pauses` (a list from LIMIT_PAUSES_S, shared by a
+    run), RuntimeError when YouTube won't give the video (private, removed)."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    pauses = list(LIMIT_PAUSES_S) if pauses is None else pauses
+    while True:
+        code, lines = run(["-f", "bestaudio[ext=webm]/bestaudio", "--no-playlist",
+                           "--sleep-requests", SLEEP_REQUESTS_S, "--windows-filenames",
+                           "--no-progress", "-P", str(DOWNLOAD_DIR),
+                           "-o", OUT_TEMPLATE,
+                           "--print", f"after_move:{FILE_MARK}%(filepath)s", watch_url(vid)],
+                          cancel=cancel)
+        for line in lines:
+            if line.startswith(FILE_MARK) and Path(line[len(FILE_MARK):]).is_file():
+                return Path(line[len(FILE_MARK):])
+        if not is_limited(lines):
+            raise RuntimeError(last_error(lines) if code else "yt-dlp gave no audio file")
+        if not limit_pause(pauses, log, cancel):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("stopped")
+            raise Limited("YouTube is limiting requests right now")
+
+
+def clear_downloads():
+    """Delete audio left in DOWNLOAD_DIR if the app was closed mid-video."""
+    if DOWNLOAD_DIR.is_dir():
+        for p in DOWNLOAD_DIR.iterdir():
+            try:
+                p.unlink()
+            except OSError:
+                pass  # still in use by another running copy of the app
+
+
+# ---- transcripts you already have ------------------------------------------------
+def same_dir(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def link(folders, transcript: Path, vid, date=None):
+    """Link a transcript file to a YouTube video, so its results play that
+    video. The link is stored in the folder entry that reads the transcript's
+    folder (one is added if there is none, reading it in place like Import
+    transcripts). date ("YYYY-MM-DD") is used if the transcript has no date
+    of its own. Returns (entry, added?)."""
+    transcript = Path(transcript)
+    if transcript.suffix.lower() not in transcripts.EXTS:
+        raise ValueError("Haystacks reads transcripts in .json, .srt and .vtt files.")
+    if not transcript.is_file():
+        raise ValueError(f"Can't find {transcript}.")
+    folder = transcript.parent
+    entry = next((f for f in folders if same_dir(pipeline.entry_dirs(f)[1], folder)), None)
+    videos = []
+    if entry and Path(entry["path"]).is_dir():
+        videos = [v.stem for v in pipeline.list_videos(Path(entry["path"]), "")]
+    found = transcripts.match(folder, videos)
+    stem = next((s for s, p in found.items() if same_dir(p, transcript)), None)
+    if stem is None:
+        other = next((p.name for s, p in found.items()
+                      if s.lower() in (c.lower() for c in transcripts.candidates(transcript))), "")
+        raise ValueError((f"{other} in the same folder" if other else "Another file")
+                         + " is used for this recording instead. Link that file, or move "
+                         "this one to its own folder.")
+    data = transcripts.read(transcript)  # raises ValueError if it isn't a transcript
+    added = entry is None
+    if added:
+        entry = {"path": str(folder), "transcripts": str(folder), "name": folder.name,
+                 "track": 1, "filter": ""}
+        folders.append(entry)
+    entry.setdefault("links", {})[stem] = vid
+    out = pipeline.entry_dirs(entry)[1]
+    if date and not data.get("created") and parse_date(stem)[0] is None             and not pipeline.read_dates(out).get(stem):
+        pipeline.store_dates(out, {stem: date})
+    return entry, added

@@ -2,6 +2,9 @@
 The built-in video player: plays a recording from the moment a result was
 said, using the folder's chosen audio track. Qt's player decodes with FFmpeg,
 so it handles MKV, MOV and camera MP4s that a browser can't.
+
+YouTube results play in the same panel through youtube_view.YouTubeView
+(mode "youtube"); the controls work on whichever is active.
 """
 from pathlib import Path
 
@@ -44,7 +47,9 @@ class PlayerPanel(QFrame):
         self.setObjectName("panel")
         self.settings = settings
         self.save = save
-        self.source = None          # path of the loaded video
+        self.source = None          # path of the loaded video, or "youtube:<id>"
+        self.mode = "file"          # or "youtube"
+        self.yt = None              # YouTubeView, made on the first YouTube video
         self.pending_ms = None      # seek once the video has loaded
         self.pending_track = None   # audio track to switch to once known
         self.dragging = False
@@ -103,7 +108,7 @@ class PlayerPanel(QFrame):
         self.volume.valueChanged.connect(self._volume_changed)
         self.volume.sliderReleased.connect(self._store_volume)
         full = self._icon_button("fullscreen", "Fullscreen (double-click the video; Esc to leave)",
-                                 lambda: self.video.setFullScreen(True))
+                                 self.full_screen)
         for w in (self.play_btn, back, fwd):
             row.addWidget(w)
         row.addSpacing(8)
@@ -116,9 +121,10 @@ class PlayerPanel(QFrame):
         self.controls = [self.play_btn, back, fwd, self.seek, full]
         self._set_controls(False)
 
-        self.player.positionChanged.connect(self._position)
-        self.player.durationChanged.connect(lambda d: self.seek.setRange(0, d))
-        self.player.playbackStateChanged.connect(self._state)
+        self.player.positionChanged.connect(lambda pos: self._position(pos, "file"))
+        self.player.durationChanged.connect(lambda d: self._duration_changed(d, "file"))
+        self.player.playbackStateChanged.connect(
+            lambda st: self._playing(st == QMediaPlayer.PlayingState, "file"))
         self.player.mediaStatusChanged.connect(self._status)
         self.player.tracksChanged.connect(self._tracks)
         self.player.errorOccurred.connect(self._error)
@@ -127,6 +133,7 @@ class PlayerPanel(QFrame):
     def play_at(self, video: Path, seconds, title, subtitle, track=1):
         """Play `video` from just before `seconds`, on audio track `track` (from 1)."""
         start = max(0, int((seconds - LEAD_IN_S) * 1000))
+        self._switch("file")
         self.title.setText(title)
         self.subtitle.setText(subtitle)
         self.stack.setCurrentWidget(self.video)
@@ -137,25 +144,70 @@ class PlayerPanel(QFrame):
             self.player.play()
             return
         self.source = str(video)
+        # Set these after setSource: when switching videos, setSource reports
+        # LoadedMedia for the old video before the new one starts loading, which
+        # would use up the seek and play the new video from the start.
+        self.player.setSource(QUrl.fromLocalFile(str(video)))
         self.pending_ms = start
         self.pending_track = max(0, track - 1)
-        self.player.setSource(QUrl.fromLocalFile(str(video)))
         self.player.play()
+
+    def play_youtube(self, video_id, seconds, title, subtitle):
+        """Play a YouTube video from just before `seconds`."""
+        if self.yt is None:
+            from youtube_view import YouTubeView  # loads the web engine
+            self.yt = YouTubeView(self.audio.volume())
+            self.yt.toggle_play.connect(self.toggle)
+            self.yt.positionChanged.connect(lambda pos: self._position(pos, "youtube"))
+            self.yt.durationChanged.connect(lambda d: self._duration_changed(d, "youtube"))
+            self.yt.playingChanged.connect(lambda on: self._playing(on, "youtube"))
+            self.yt.failed.connect(self._youtube_failed)
+            self.stack.addWidget(self.yt)
+        self._switch("youtube")
+        self.title.setText(title)
+        self.subtitle.setText(subtitle)
+        self.stack.setCurrentWidget(self.yt)
+        self._set_controls(True)
+        if self.source != f"youtube:{video_id}":
+            same = self.yt.video_id == video_id  # back from a file: duration already known
+            self.seek.setRange(0, self.yt.duration if same else 0)
+        self.source = f"youtube:{video_id}"
+        self.yt.set_muted(self.audio.isMuted())
+        self.yt.play_at(video_id, max(0.0, seconds - LEAD_IN_S))
 
     def toggle(self):
         if not self.source:
             return
-        if self.player.playbackState() == QMediaPlayer.PlayingState:
+        if self.mode == "youtube":
+            self.yt.toggle()
+        elif self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
         else:
             self.player.play()
 
     def skip(self, ms):
-        if self.source:
+        if not self.source:
+            return
+        if self.mode == "youtube":
+            self.yt.seek(self.yt.position + ms)
+        else:
             self.player.setPosition(max(0, self.player.position() + ms))
+
+    def pause(self):
+        self.player.pause()
+        if self.yt:
+            self.yt.pause()
 
     def stop(self):
         self.player.stop()
+        if self.yt:
+            self.yt.stop()
+
+    def full_screen(self):
+        if self.mode == "youtube":
+            self.yt.set_full_screen(True)
+        else:
+            self.video.setFullScreen(True)
 
     # ---- internals ------------------------------------------------------------
     def _icon_button(self, kind, tip, action):
@@ -171,21 +223,49 @@ class PlayerPanel(QFrame):
         for w in self.controls:
             w.setEnabled(on)
 
-    def _time_text(self, pos):
-        return f"{hms(pos / 1000)} / {hms(self.player.duration() / 1000)}"
+    def _switch(self, mode):
+        """Pause whichever player isn't the one about to play."""
+        if mode == self.mode:
+            return
+        if self.mode == "youtube":
+            self.yt.stop()
+        else:
+            self.player.pause()
+        self.mode = mode
+        self.source = None
 
-    def _position(self, pos):
-        if not self.dragging:
+    def _duration(self):
+        return self.yt.duration if self.mode == "youtube" else self.player.duration()
+
+    def _time_text(self, pos):
+        return f"{hms(pos / 1000)} / {hms(self._duration() / 1000)}"
+
+    def _duration_changed(self, d, mode):
+        if mode == self.mode:
+            self.seek.setRange(0, d)
+
+    def _position(self, pos, mode):
+        if mode == self.mode and not self.dragging:
             self.seek.setValue(pos)
             self.time.setText(self._time_text(pos))
 
     def _seek_released(self):
         self.dragging = False
-        self.player.setPosition(self.seek.value())
+        if self.mode == "youtube":
+            self.yt.seek(self.seek.value())
+        else:
+            self.player.setPosition(self.seek.value())
 
-    def _state(self, state):
-        self.play_btn.setIcon(theme.icon("pause" if state == QMediaPlayer.PlayingState
-                                         else "play"))
+    def _playing(self, playing, mode):
+        if mode == self.mode:
+            self.play_btn.setIcon(theme.icon("pause" if playing else "play"))
+
+    def _youtube_failed(self, text):
+        self.source = None
+        self._set_controls(False)
+        self.message.setText(f"This video can't play here.\n{text}\n\nRight-click the "
+                             "result and choose Open on YouTube.")
+        self.stack.setCurrentWidget(self.message)
 
     def _status(self, status):
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) \
@@ -211,6 +291,8 @@ class PlayerPanel(QFrame):
     def _volume_changed(self, value):
         self.audio.setVolume(value / 100)
         self.audio.setMuted(False)
+        if self.yt:
+            self.yt.set_volume(value / 100)
         self.mute_btn.setIcon(theme.icon("volume" if value else "mute"))
 
     def _store_volume(self):
@@ -219,4 +301,6 @@ class PlayerPanel(QFrame):
 
     def toggle_mute(self):
         self.audio.setMuted(not self.audio.isMuted())
+        if self.yt:
+            self.yt.set_muted(self.audio.isMuted())
         self.mute_btn.setIcon(theme.icon("mute" if self.audio.isMuted() else "volume"))

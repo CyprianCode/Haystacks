@@ -35,11 +35,13 @@ def show_error(text):
 
 
 try:
+    from PySide6.QtCore import QCoreApplication, Qt
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
     import paths
     import pipeline
     import theme
+    import youtube
     from search_window import MainWindow
     from transcribe_window import TranscribeWindow
 except Exception:
@@ -71,11 +73,15 @@ def save_settings(data):
 
 def main():
     pipeline.cleanup_temp()
+    youtube.clear_downloads()
     try:  # own taskbar entry and icon, instead of Python's
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Haystacks.Haystacks")
     except Exception:
         pass
+    # Needed before the app starts for the YouTube player's web engine, which is
+    # only loaded when the first YouTube video plays.
+    QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("Haystacks")
     app.setWindowIcon(QIcon(str(paths.resource("assets/haystacks.ico"))))

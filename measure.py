@@ -1,7 +1,8 @@
 """
 Background job for imported transcripts: reads each video's recording date
 (quick) and measures its loudness (one full read of the audio), so imported
-recordings get proper dates and show up under Loudest moments.
+recordings get proper dates and show up under Loudest moments. Also stores
+the date in the app's own transcripts made before dates were stored.
 
 Resumable: anything already measured is skipped, so it simply picks up again
 the next time the app starts. Waits while a transcription is running.
@@ -52,7 +53,16 @@ class Measurer:
             for entry in list(self.settings.get("folders", [])):
                 folder, out, imported = pipeline.entry_dirs(entry)
                 if not imported:
-                    continue  # the app's own transcripts already have both
+                    # The app's own transcripts have loudness; only ones made
+                    # before dates were stored need their date. A transcription
+                    # run does this itself at the end, so leave it to that.
+                    if not self.busy():
+                        try:
+                            if pipeline.add_missing_dates(folder, log=lambda s: None):
+                                self.changed = True
+                        except Exception:
+                            pass  # folder offline (e.g. a network drive); try next time
+                    continue
                 try:
                     need_date, need_loud = pipeline.measure_todo(folder, out)
                 except OSError:
