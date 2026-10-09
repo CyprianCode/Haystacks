@@ -15,11 +15,11 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
-                               QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-                               QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QComboBox,
+                               QDialog, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
+                               QPushButton, QRadioButton, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 import engine
 import paths
@@ -104,7 +104,7 @@ class TranscribeWindow(QWidget):
         self.add_btn = button("Add folder...", self.add_folder)
         self.import_btn = button("Import transcripts...", self.import_transcripts)
         self.yt_btn = button("Add YouTube...", self.add_youtube)
-        self.yt_btn.setToolTip("Search YouTube videos using their subtitles")
+        self.yt_btn.setToolTip("Search YouTube videos, using their subtitles or transcribing them")
         self.link_btn = button("Link to YouTube...", self.link_youtube)
         self.link_btn.setToolTip("Use a transcript you already have for a video on YouTube")
         self.remove_btn = button("Remove from list", self.remove_folder)
@@ -299,9 +299,11 @@ class TranscribeWindow(QWidget):
             folder, out, imported = pipeline.entry_dirs(f)
             if f.get("youtube"):
                 n = youtube.count(f)
-                item = QTreeWidgetItem([f"YouTube: {f.get('name') or f['youtube']}", "-", "-",
+                how = {"fill": "  (subtitles, else transcribed)",
+                       "transcribe": "  (transcribed)"}.get(youtube.source(f), "")
+                item = QTreeWidgetItem([f"YouTube: {f.get('name') or f['youtube']}{how}", "-", "-",
                                         f"{n:,} video{'s' if n != 1 else ''}"])
-                item.setToolTip(0, f"{f['youtube']}\nSubtitles: {out}")
+                item.setToolTip(0, f"{f['youtube']}\nTranscripts: {out}")
                 self.tree.addTopLevelItem(item)
                 continue
             try:
@@ -354,7 +356,10 @@ class TranscribeWindow(QWidget):
         if tube:  # no audio track or file names to choose
             self.track_box.setEnabled(False)
             self.filter_entry.setEnabled(False)
-        self.run_sel_btn.setText("Get new subtitles" if tube else "Transcribe selected folder")
+        self.run_sel_btn.setText(
+            "Transcribe selected folder" if not tube
+            else "Get new subtitles" if youtube.source(self.folders[i]) == "subtitles"
+            else "Get new videos")
         self.clear_btn.setToolTip("Transcripts for this folder were imported, so the app "
                                   "won't delete them." if imported else "")
 
@@ -433,6 +438,8 @@ class TranscribeWindow(QWidget):
         """True if any of these folders has a video still to transcribe."""
         for job in jobs:
             if job.get("youtube"):
+                if youtube.source(job) != "subtitles":  # may well have videos to transcribe
+                    return True
                 continue
             folder, out, _ = pipeline.entry_dirs(job)
             try:
@@ -465,7 +472,7 @@ class TranscribeWindow(QWidget):
         self.refresh()
         self.tree.setCurrentItem(self.tree.topLevelItem(len(self.folders) - 1))
         self.log(f"Added YouTube: {dlg.entry['name']} ({dlg.entry['youtube']}), "
-                 f"subtitles saved in {dlg.entry['path']}.")
+                 f"transcripts saved in {dlg.entry['path']}.")
         self.start(all_folders=False)
 
     def link_youtube(self):
@@ -549,7 +556,8 @@ class TranscribeWindow(QWidget):
         self.stop.clear()
         self.run = {"start": time.time(), "files": 0, "audio": 0.0,
                     "done_files": 0, "done_audio": 0.0, "cur": None,
-                    "dec_audio": 0.0, "dec_wall": 0.0, "tr_audio": 0.0, "tr_wall": 0.0}
+                    "dec_audio": 0.0, "dec_wall": 0.0, "tr_audio": 0.0, "tr_wall": 0.0,
+                    "dl_audio": 0.0, "dl_wall": 0.0}
         for w in self.edit_widgets:
             w.setEnabled(False)
         self.sync_folder_fields()
@@ -570,12 +578,15 @@ class TranscribeWindow(QWidget):
         log = lambda text: post("log", text)
         pipeline.keep_awake(True)
         done = failed = 0
+        limited = False  # YouTube kept limiting audio downloads: skip the rest
         audio_s = 0.0
         t_start = time.time()
-        tube_jobs = [j for j in jobs if j.get("youtube")]
+        subs_jobs = [j for j in jobs if j.get("youtube") and youtube.source(j) != "transcribe"]
+        tube_jobs = [j for j in jobs if j.get("youtube") and youtube.source(j) != "subtitles"]
         jobs = [j for j in jobs if not j.get("youtube")]
         try:
-            tube = self.fetch_subtitles(tube_jobs, post, log) if tube_jobs else None
+            tube, listed = (self.fetch_subtitles(subs_jobs, post, log) if subs_jobs
+                            else (None, {}))
             plan = []
             for job in jobs:
                 folder, out, imported = pipeline.entry_dirs(job)
@@ -584,8 +595,33 @@ class TranscribeWindow(QWidget):
                     continue
                 videos, todo = pipeline.pending(folder, job["filter"], out)
                 log(f"{folder}: {len(videos)} videos, {len(todo)} to transcribe.")
-                plan.append((folder, job["track"], todo, out, imported))
-            all_todo = [v for _, _, todo, _, _ in plan for v in todo]
+                plan.append((folder, job["track"], todo, out, imported, None))
+            # YouTube videos to transcribe: in the plan by id; their audio is
+            # downloaded just before each one is transcribed.
+            titles, tube_lengths = {}, {}
+            for job in tube_jobs:
+                if self.stop.is_set():
+                    break
+                name = job.get("name") or job["youtube"]
+                videos = listed.get(job["path"])
+                try:
+                    if videos is None:
+                        post("status", f"Listing videos: {name}")
+                        youtube.ensure_tool(log, self.stop)
+                        videos = youtube.list_videos(job["youtube"], self.stop)[1]
+                except InterruptedError:
+                    break
+                except Exception as e:
+                    log(f"{name}: couldn't list the videos: {e}")
+                    continue
+                todo = youtube.to_transcribe(job, videos)
+                log(f"{name}: {len(videos)} videos, {len(todo)} to download and transcribe.")
+                for vid, vtitle, length in todo:
+                    titles[vid] = vtitle or vid
+                    tube_lengths[vid] = length
+                plan.append((Path(job["path"]), 1, [v[0] for v in todo],
+                             Path(job["transcripts"]), True, job))
+            all_todo = [v for _, _, todo, *_ in plan for v in todo]
             total = len(all_todo)
             if self.stop.is_set():
                 plan, all_todo, total = [], [], 0
@@ -593,30 +629,36 @@ class TranscribeWindow(QWidget):
             # Video lengths, so progress and time left are weighted by audio length.
             lengths = {}
             if total:
-                post("status", f"Measuring the length of {total} videos...")
-                with ThreadPoolExecutor(8) as pool:
-                    lengths = dict(zip(all_todo, pool.map(pipeline.probe_duration, all_todo)))
+                files = [v for v in all_todo if isinstance(v, Path)]
+                if files:
+                    post("status", f"Measuring the length of {len(files)} videos...")
+                    with ThreadPoolExecutor(8) as pool:
+                        lengths = dict(zip(files, pool.map(pipeline.probe_duration, files)))
+                lengths.update((v, tube_lengths.get(v)) for v in all_todo if not isinstance(v, Path))
                 known = [d for d in lengths.values() if d]
                 fallback = sum(known) / len(known) if known else 0.0
                 lengths = {v: d or fallback for v, d in lengths.items()}
                 log(f"{total} videos to transcribe, {minutes(sum(lengths.values()))} of video.")
-            if jobs:
+            if jobs or tube_jobs:
                 post("plan", total, sum(lengths.values()), "transcribe")
 
+            pauses = list(youtube.LIMIT_PAUSES_S)  # waits for YouTube's limits, per run
             with contextlib.ExitStack() as stack:
                 asr = None
-                for folder, track, todo, out, imported in plan:
+                for folder, track, todo, out, imported, tube_job in plan:
                     for video in todo:
-                        if self.stop.is_set():
+                        if self.stop.is_set() or (tube_job and limited):
                             break
-                        if asr is None:  # load the model only if there is work
+                        if asr is None and not tube_job:  # load the model only if there is work
                             post("status", "Loading the speech engine...")
                             model, name = pipeline.load_asr()
                             asr = stack.enter_context(model)
                             log(f"Speech engine ready ({name}).")
                         est = lengths.get(video, 0.0)
-                        post("video", done + 1, video.name, est)
-                        post("status", f"Working in {folder.name}")
+                        shown = titles[video] if tube_job else video.name
+                        post("video", done + 1, shown, est)
+                        post("status", f"Working in {tube_job.get('name') or folder.name}"
+                                       if tube_job else f"Working in {folder.name}")
                         last = [-1.0]
 
                         def on_decode(f, last=last):
@@ -624,22 +666,53 @@ class TranscribeWindow(QWidget):
                                 last[0] = f
                                 post("decode", f)
 
+                        dl_wall, audio_file = 0.0, None
                         try:
+                            if tube_job:
+                                post("phase", "download", time.time())
+                                t0 = time.time()
+                                try:
+                                    audio_file = youtube.download_audio(video, log, self.stop,
+                                                                        pauses)
+                                except youtube.Limited as e:
+                                    limited = True
+                                    log(f"{e}. What was transcribed is kept; try again later "
+                                        f"to get the rest.")
+                                    break
+                                dl_wall = time.time() - t0
+                                if asr is None:  # loaded once a video is here to transcribe
+                                    post("status", "Loading the speech engine...")
+                                    model, name = pipeline.load_asr()
+                                    asr = stack.enter_context(model)
+                                    log(f"Speech engine ready ({name}).")
                             dur, n, dec_wall, tr_wall = pipeline.process(
-                                asr, video, track, est or None,
+                                asr, audio_file or video, track, est or None,
                                 on_phase=lambda ph: post("phase", ph, time.time()),
                                 on_decode=on_decode, out=out)
                             audio_s += dur
-                            log(f"[{done + 1}/{total}] {video.name}: {dur / 60:.0f} min of "
-                                f"audio, read in {dec_wall:.0f}s, transcribed in "
-                                f"{tr_wall:.0f}s ({dur / max(tr_wall, 1e-6):.1f}x), "
+                            log(f"[{done + 1}/{total}] {shown}: {dur / 60:.0f} min of "
+                                f"audio, " + (f"downloaded in {dl_wall:.0f}s, " if tube_job else
+                                              f"read in {dec_wall:.0f}s, ") +
+                                f"transcribed in {tr_wall:.0f}s ({dur / max(tr_wall, 1e-6):.1f}x), "
                                 f"{n} sentence{'' if n == 1 else 's'}")
-                            post("video_done", est, dur, dec_wall, tr_wall)
+                            if tube_job:
+                                youtube.note_try(tube_job, video, True)
+                            post("video_done", est, dur, dec_wall, tr_wall, dl_wall)
+                        except InterruptedError:  # Stop while downloading
+                            break
                         except Exception as e:
                             failed += 1
-                            pipeline.log_failure(video, e, out)
-                            log(f"[{done + 1}/{total}] FAILED {video.name}: {e}")
+                            if tube_job:  # tried again after a day, at most 3 times
+                                youtube.note_try(tube_job, video, False)
+                                pipeline.log_failure(audio_file or Path(f"{shown} [{video}]"), e, out)
+                            else:
+                                pipeline.log_failure(video, e, out)
+                            log(f"[{done + 1}/{total}] FAILED {shown}: {e}")
                             post("video_done", est, 0.0, 0.0, 0.0)
+                        finally:
+                            if audio_file:  # no audio is kept
+                                with contextlib.suppress(OSError):
+                                    audio_file.unlink()
                         done += 1
                     try:  # dates for transcripts made before dates were stored
                         if not imported:  # imported files are never changed
@@ -657,7 +730,7 @@ class TranscribeWindow(QWidget):
             if failed:
                 summary += f" {failed} failed, see _failed.txt in the folder."
             if tube is not None:
-                summary = (tube if not jobs or (self.stop.is_set() and not total)
+                summary = (tube if not (jobs or tube_jobs) or (self.stop.is_set() and not total)
                            else f"{tube} {summary}")
         except Exception as e:
             log(traceback.format_exc())
@@ -668,8 +741,9 @@ class TranscribeWindow(QWidget):
 
     def fetch_subtitles(self, jobs, post, log):
         """Get new subtitles for YouTube folder entries (worker thread). Returns
-        a one-line summary."""
+        (a one-line summary, {entry path: [(id, title, length)] of its videos})."""
         new = missing = 0
+        listed = {}
         for job in jobs:
             if self.stop.is_set():
                 break
@@ -677,7 +751,7 @@ class TranscribeWindow(QWidget):
             post("status", f"Getting subtitles: {name}")
             try:
                 youtube.ensure_tool(log, self.stop)
-                n_new, n_missing, _ = youtube.fetch(
+                n_new, n_missing, listed[job["path"]] = youtube.fetch(
                     job, log, cancel=self.stop,
                     on_plan=lambda n: post("plan", n, 0.0, "subs"),
                     on_video=lambda i, title: post("video", i, title, 0.0))
@@ -692,7 +766,7 @@ class TranscribeWindow(QWidget):
                 + f"YouTube: {new:,} new video{'s' if new != 1 else ''} with subtitles")
         if missing:
             text += f", {missing:,} without subtitles"
-        return text + "."
+        return text + ".", listed
 
     # ---- progress display -------------------------------------------------
     def speeds(self):
@@ -713,6 +787,8 @@ class TranscribeWindow(QWidget):
                     if done and files else None)
             return None, None, done / files if files else 0.0, left
         dec, tr = self.speeds()
+        # YouTube audio downloads, measured in this run only (networks vary).
+        dl = r["dl_audio"] / r["dl_wall"] if r["dl_wall"] > 0.5 else None
         cur = r["cur"]
         cur_frac = cur_left = None
         if cur:
@@ -721,7 +797,9 @@ class TranscribeWindow(QWidget):
             t_tr = a / tr if tr and a else None
             elapsed = time.time() - cur["phase_start"]
             if t_tr is not None:
-                if cur["phase"] == "decode":
+                if cur["phase"] == "download":
+                    cur_left = max((a / dl if dl else 0.0) - elapsed, 0.0) + t_dec + t_tr
+                elif cur["phase"] == "decode":
                     f = cur["decode_frac"]
                     cur_frac = f * t_dec / (t_dec + t_tr)
                     cur_left = (1 - f) * t_dec + t_tr
@@ -738,7 +816,8 @@ class TranscribeWindow(QWidget):
 
         total_left = None
         if tr:
-            per_audio = 1 / tr + (1 / dec if dec else 0.0)  # wall seconds per audio second
+            # wall seconds per audio second
+            per_audio = 1 / tr + (1 / dec if dec else 0.0) + (1 / dl if dl else 0.0)
             rest = r["audio"] - r["done_audio"] - (cur["audio"] if cur else 0.0)
             total_left = max(rest, 0.0) * per_audio
             if cur:
@@ -768,7 +847,10 @@ class TranscribeWindow(QWidget):
             self.cur_detail.setText("Getting subtitles")
         elif cur:
             self.cur_label.setText(f"Current video ({cur['index']} of {r['files']}): {cur['name']}")
-            if cur["phase"] == "decode":
+            if cur["phase"] == "download":
+                self.set_bar(self.cur_bar, None)
+                detail = "Downloading the audio from YouTube"
+            elif cur["phase"] == "decode":
                 # Before the first speed measurement, show plain decoding progress.
                 self.set_bar(self.cur_bar, cur_frac if cur_frac is not None
                              else cur["decode_frac"])
@@ -780,7 +862,7 @@ class TranscribeWindow(QWidget):
                 self.set_bar(self.cur_bar, cur_frac)
                 detail = (f"Transcribing {cur_frac:.0%}, {approx(cur_left)} left"
                           if cur_left > 0 else "Transcribing, almost done")
-            if cur_left is not None and cur["phase"] == "decode":
+            if cur_left is not None and cur["phase"] in ("download", "decode"):
                 detail += f", {approx(cur_left)} left for this video"
             self.cur_detail.setText(detail)
         else:
@@ -848,10 +930,13 @@ class TranscribeWindow(QWidget):
             if r["cur"]:
                 r["cur"]["decode_frac"] = args[0]
         elif kind == "video_done":
-            est, dur, dec_wall, tr_wall = args
+            est, dur, dec_wall, tr_wall, *dl_wall = args
             r["done_files"] += 1
             r["done_audio"] += est
             r["cur"] = None
+            if dur and dl_wall:
+                r["dl_audio"] += dur
+                r["dl_wall"] += dl_wall[0]
             if dur:
                 r["dec_audio"] += dur
                 r["dec_wall"] += dec_wall
@@ -1080,11 +1165,11 @@ class YouTubeDialog(QDialog):
         lay.setContentsMargins(22, 18, 22, 18)
         lay.setSpacing(12)
         lay.addWidget(label("Add YouTube videos", "section"))
-        intro = label("Search YouTube videos by what is said in them, using the subtitles "
-                      "YouTube already has: the uploader's own, or else YouTube's automatic "
-                      "captions. Only the subtitle text is downloaded (a few KB per video); "
-                      "the videos play from YouTube, so playing needs an internet "
-                      "connection.", "muted")
+        intro = label("Search YouTube videos by what is said in them. The text comes from the "
+                      "subtitles YouTube already has (the uploader's own, or else YouTube's "
+                      "automatic captions), or from transcribing the videos here with your "
+                      "speech engine, like your own videos. The videos play from YouTube, so "
+                      "playing needs an internet connection.", "muted")
         intro.setWordWrap(True)
         lay.addWidget(intro)
 
@@ -1099,18 +1184,33 @@ class YouTubeDialog(QDialog):
         grid.addWidget(label("YouTube link"), 0, 0)
         grid.addWidget(self.url_edit, 0, 1)
         grid.addWidget(self.look_btn, 0, 2)
+        sources = QVBoxLayout()
+        sources.setSpacing(0)
+        self.sources = QButtonGroup(self)
+        for src, text in (("subtitles", "YouTube's subtitles (quick: only the text is downloaded)"),
+                          ("fill", "YouTube's subtitles, and transcribe the videos that have none"),
+                          ("transcribe", "Transcribe every video here (downloads the audio, "
+                                         "deleted once transcribed)")):
+            b = QRadioButton(text)
+            b.setProperty("source", src)
+            b.setChecked(src == "subtitles")
+            self.sources.addButton(b)
+            sources.addWidget(b)
+        self.sources.buttonToggled.connect(lambda b, on: on and self.source_changed())
+        grid.addWidget(label("Text from"), 1, 0, Qt.AlignTop)
+        grid.addLayout(sources, 1, 1)
         self.lang_box = QComboBox()
         for code, name in engine.LANGUAGES:
             if code != "auto":
                 self.lang_box.addItem(name, code)
-        grid.addWidget(label("Subtitle language"), 1, 0)
-        grid.addWidget(self.lang_box, 1, 1, Qt.AlignLeft)
+        grid.addWidget(label("Subtitle language"), 2, 0)
+        grid.addWidget(self.lang_box, 2, 1, Qt.AlignLeft)
         self.dir_edit = QLineEdit()
         self.dir_edit.setReadOnly(True)
         self.dir_edit.setPlaceholderText("Filled in after the lookup")
-        grid.addWidget(label("Save subtitles in"), 2, 0)
-        grid.addWidget(self.dir_edit, 2, 1)
-        grid.addWidget(button("Browse...", self.pick_dir), 2, 2)
+        grid.addWidget(label("Save transcripts in"), 3, 0)
+        grid.addWidget(self.dir_edit, 3, 1)
+        grid.addWidget(button("Browse...", self.pick_dir), 3, 2)
         grid.setColumnStretch(1, 1)
         lay.addLayout(grid)
 
@@ -1172,19 +1272,45 @@ class YouTubeDialog(QDialog):
         if not self.chosen_dir:
             safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip(" .") or "YouTube"
             self.dir_edit.setText(str(paths.DATA / "YouTube" / safe[:80]))
-        count = f"{len(videos):,} video{'s' if len(videos) != 1 else ''}"
-        self.summary.setText(
-            f"Found {count} in \"{name}\".\n\nSubtitles are fetched next, a couple of seconds "
-            f"per video" + (f" (about {minutes(len(videos) * 3)} for all of them)"
-                            if len(videos) > 20 else "") +
-            ". Videos without subtitles in the chosen language are skipped and tried again "
-            "on later runs. Run it again any time to add new uploads.")
+        self.show_found()
         self.ok.setEnabled(True)
+
+    def source(self):
+        return self.sources.checkedButton().property("source")
+
+    def source_changed(self):
+        src = self.source()
+        self.lang_box.setEnabled(src != "transcribe")
+        self.ok.setText("Add and get subtitles" if src == "subtitles" else "Add and transcribe")
+        if self.found:
+            self.show_found()
+
+    def show_found(self):
+        """What the lookup found, and what happens next with the chosen source."""
+        _, name, videos = self.found
+        src = self.source()
+        count = f"{len(videos):,} video{'s' if len(videos) != 1 else ''}"
+        length = sum(v[2] or 0 for v in videos)
+        text = f"Found {count} in \"{name}\"" + (f", {minutes(length)} in all" if length else "")
+        if src == "subtitles":
+            text += (".\n\nSubtitles are fetched next, a couple of seconds per video"
+                     + (f" (about {minutes(len(videos) * 3)} for all of them)"
+                        if len(videos) > 20 else "") +
+                     ". Videos without subtitles in the chosen language are skipped and tried "
+                     "again on later runs.")
+        else:
+            text += (".\n\n" + ("Subtitles are fetched first. The videos without any are "
+                                "transcribed: " if src == "fill" else
+                                "Each video is transcribed: ")
+                     + "its audio is downloaded (about 1 MB per minute of video), transcribed "
+                     "with the speech engine set in Add videos, then deleted. That speech "
+                     "engine's language is used.")
+        self.summary.setText(text + " Run it again any time to add new uploads.")
         self.adjustSize()
 
     def pick_dir(self):
         start = self.dir_edit.text() or str(paths.DATA)
-        d = QFileDialog.getExistingDirectory(self, "Choose where to save the subtitles", start)
+        d = QFileDialog.getExistingDirectory(self, "Choose where to save the transcripts", start)
         if d:
             self.dir_edit.setText(str(Path(d)))
             self.chosen_dir = True
@@ -1195,11 +1321,11 @@ class YouTubeDialog(QDialog):
         folder = self.dir_edit.text()
         if any(f["path"].lower() == folder.lower() for f in self.folders):
             self.summary.setText("That folder is already in the list. Choose another "
-                                 "place to save these subtitles.")
+                                 "place to save these transcripts.")
             return
         self.entry = {"path": folder, "transcripts": folder, "youtube": self.found[0],
                       "name": self.found[1], "lang": self.lang_box.currentData(),
-                      "track": 1, "filter": ""}
+                      "source": self.source(), "track": 1, "filter": ""}
         self.accept()
 
 

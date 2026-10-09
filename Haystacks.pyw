@@ -41,6 +41,7 @@ try:
     import paths
     import pipeline
     import theme
+    import youtube
     from search_window import MainWindow
     from transcribe_window import TranscribeWindow
 except Exception:
@@ -72,6 +73,7 @@ def save_settings(data):
 
 def main():
     pipeline.cleanup_temp()
+    youtube.clear_downloads()
     try:  # own taskbar entry and icon, instead of Python's
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Haystacks.Haystacks")

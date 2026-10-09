@@ -34,8 +34,9 @@ recognition engine, or a Whisper model if you prefer.
 - **Search YouTube videos** by what is said in them. Paste a link to a video,
   playlist or channel under **Add videos > Add YouTube...** and Haystacks
   fetches the subtitles YouTube already has (the uploader's own, or else
-  YouTube's automatic captions; a few KB per video, no video is downloaded).
-  Results play in the built-in player, with the same controls. See
+  YouTube's automatic captions; a few KB per video), or transcribes the videos
+  itself with your speech engine. Results play in the built-in player, with
+  the same controls. See
   [YouTube videos](#youtube-videos).
 - **Link your own transcripts to YouTube.** Have a transcript of a video
   that's on YouTube? **Add videos > Link to YouTube...** pairs the file with
@@ -109,24 +110,36 @@ without the speech engine.
 ### YouTube videos
 
 **Add videos > Add YouTube...** takes a link to a single video, a playlist or a
-channel, and a subtitle language. Haystacks downloads
-[yt-dlp](https://github.com/yt-dlp/yt-dlp) the first time (about 18 MB, kept
-up to date automatically), then fetches one subtitle file per video. Select the
-YouTube entry and press **Get new subtitles** (or **Transcribe all folders**) at
-any time to add new uploads; videos already fetched are skipped.
+channel. Haystacks downloads [yt-dlp](https://github.com/yt-dlp/yt-dlp) the
+first time (about 18 MB, kept up to date automatically). Choose where the text
+comes from:
+
+- **YouTube's subtitles:** one subtitle file per video, in the language you
+  choose. Quick, and nothing else is downloaded.
+- **YouTube's subtitles, and transcribe the videos that have none.**
+- **Transcribe every video here:** each video's audio is downloaded (about
+  1 MB per minute of video), transcribed with your speech engine like your own
+  videos, and deleted right after. Slower, but usually more accurate than
+  automatic captions, and it works for videos with no subtitles at all.
+
+Select the YouTube entry and press **Get new subtitles** / **Get new videos**
+(or **Transcribe all folders**) at any time to add new uploads; videos already
+done are skipped.
 
 - Videos without subtitles in that language are skipped and tried again on
   later runs (automatic captions can take a few hours to appear after upload).
+  A video that can't be downloaded or transcribed is tried again the next day,
+  up to three times.
 - Automatic captions have more mistakes than the speech engine, and sometimes
   no punctuation.
 - Playing needs an internet connection. A few videos can't be played outside
   YouTube by their owner's choice; right-click a result and choose **Open on
   YouTube** to watch it there, at the same moment.
-- YouTube limits how fast subtitles can be fetched. For a big channel it may
-  stop partway with a message; what was fetched is kept, and running it again
-  later continues.
-- YouTube videos have no loudness data, so they don't appear in Loudest
-  moments.
+- YouTube limits how fast subtitles and audio can be fetched. For a big
+  channel it may stop partway with a message; what was fetched is kept, and
+  running it again later continues.
+- Only transcribed YouTube videos have loudness data, so videos searched by
+  their subtitles don't appear in Loudest moments.
 
 **Transcripts you already have:** **Add videos > Link to YouTube...** takes a
 transcript file (Haystacks or Whisper JSON, `.srt` or `.vtt`) and the link to
@@ -145,10 +158,13 @@ uploaded video: a transcript of a longer or edited recording will be off.
   `<stem>.json` per video, plus `_loudness\` (loudness data) and
   `_failed.txt` (if a video couldn't be transcribed). No audio files are
   kept; audio is decoded from the video into memory.
-- **YouTube subtitles** go in `%LOCALAPPDATA%\Haystacks\YouTube\<name>` (or
-  the folder you chose): one `.vtt` per video, named
-  `<upload date> <title> [<video id>].<language>.vtt`, plus `_youtube.json`
-  (videos that had no subtitles).
+- **YouTube subtitles and transcripts** go in
+  `%LOCALAPPDATA%\Haystacks\YouTube\<name>` (or the folder you chose): one
+  file per video, `<upload date> <title> [<video id>].<language>.vtt` for
+  subtitles or `<upload date> <title> [<video id>].json` for a transcribed
+  video (with `_loudness\`), plus `_youtube.json` (videos that had no
+  subtitles or failed to transcribe). Downloaded audio waits in
+  `%TEMP%\Haystacks-yt` only until it is transcribed.
 - **Settings** (folder list, hidden recordings, window layout):
   `%APPDATA%\Haystacks\settings.json`.
 - **The app** is installed in `%LOCALAPPDATA%\Programs\Haystacks`.
@@ -208,7 +224,7 @@ desktop shortcut to the source version.
 | `Haystacks.pyw` | Entry point: settings, theme, crash dialog. |
 | `search_window.py` | Main window: search, filters, results list, Loudest moments. |
 | `player.py` | Built-in video player panel. |
-| `youtube.py` | Fetching YouTube subtitles with yt-dlp. |
+| `youtube.py` | Fetching YouTube subtitles and audio with yt-dlp. |
 | `youtube_view.py` | Playing YouTube videos in the player panel (Qt WebEngine). |
 | `transcribe_window.py` | "Add videos" window: folders, audio tracks, transcription progress, importing, adding YouTube videos. |
 | `engine.py`, `engine_dialog.py` | Choosing, downloading and testing the speech model and engine. |

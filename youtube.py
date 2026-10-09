@@ -1,14 +1,21 @@
 """
-YouTube videos as a source of transcripts: the subtitles YouTube already has
-(the uploader's, else its automatic captions) are fetched with yt-dlp, one
-WebVTT file per video, and searched like any imported transcripts. No video
-or audio is downloaded.
+YouTube videos as a source of transcripts, fetched with yt-dlp and searched
+like any imported transcripts. Where the text comes from is the entry's
+"source":
+    "subtitles"   the subtitles YouTube already has (the uploader's, else its
+                  automatic captions), one WebVTT file per video (the default)
+    "fill"        those subtitles, and the videos without any are transcribed
+    "transcribe"  every video is transcribed with the chosen speech engine
+To transcribe, only the audio is downloaded (download_audio), into a temporary
+folder, and deleted once the transcript is written. Videos always play from
+YouTube.
 
 A YouTube source is a folder entry
-    {"path": D, "transcripts": D, "youtube": <url>, "lang": "en", ...}
-where D holds "<upload date> <title> [<video id>].<lang>.vtt". The date at the
-front is the recording date search uses (search_data.parse_date); the id at the
-end is what the player plays.
+    {"path": D, "transcripts": D, "youtube": <url>, "lang": "en", "source": ..., ...}
+where D holds "<upload date> <title> [<video id>].<lang>.vtt" or, for
+transcribed videos, "<upload date> <title> [<video id>].json" (app JSON, with
+loudness in D\\_loudness). The date at the front is the recording date search
+uses (search_data.parse_date); the id at the end is what the player plays.
 
 yt-dlp itself is downloaded on first use into the engine folder (so the
 uninstaller removes it) and updated at most once a day, since YouTube changes
@@ -19,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -36,6 +44,9 @@ STAMP = TOOL_DIR / "_updated"
 RELEASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/"
 UPDATE_EVERY_S = 24 * 3600
 STATE = "_youtube.json"   # videos that had no subtitles: {id: {"checked", "tries"}}
+FAILED_DOWNLOADS = "_download"  # key in STATE: {id: {"checked", "tries"}} of videos that failed to download or transcribe
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "Haystacks-yt"  # audio waiting to be transcribed
+SOURCES = ("subtitles", "fill", "transcribe")
 RETRY_AFTER_S = 24 * 3600  # automatic captions can take hours to appear
 MAX_TRIES = 3
 # Gentler on YouTube: a pause between yt-dlp's requests for each video's page
@@ -50,10 +61,40 @@ NAME_RE = re.compile(rf"^(?:\d{{4}}-\d\d-\d\d |NA )?(.*?) ?\[{ID}\](?:\.[\w-]+)?
 TAB_SUFFIX = re.compile(r" - (Videos|Shorts|Live|Streams|Home)$")
 OUT_TEMPLATE = "%(upload_date>%Y-%m-%d)s %(title).120B [%(id)s].%(ext)s"
 MARK = "@@video "
+FILE_MARK = "@@file "
 # yt-dlp's stand-ins for characters Windows doesn't allow in file names.
 UNSAFE = str.maketrans({"\uff1f": "?", "\uff1a": ":", "\u29f8": "/", "\u29f9": "\\",
                         "\uff02": '"', "\uff0a": "*", "\uff1c": "<", "\uff1e": ">",
                         "\uff5c": "|"})
+
+
+class Limited(RuntimeError):
+    """YouTube is limiting requests (HTTP 429) and the waits are used up."""
+
+
+def source(entry):
+    """Where a YouTube entry's text comes from (see SOURCES)."""
+    return entry.get("source") if entry.get("source") in SOURCES else "subtitles"
+
+
+def is_limited(lines):
+    return any("429" in l or "Too Many Requests" in l
+               for l in lines if l.startswith(("ERROR: ", "WARNING: ")))
+
+
+def limit_pause(pauses, log, cancel):
+    """YouTube is limiting requests: wait the next pause in `pauses` (a list
+    made from LIMIT_PAUSES_S, used up over a whole run). False if none are
+    left, or Stop was pressed while waiting."""
+    if not pauses or (cancel is not None and cancel.is_set()):
+        return False
+    wait = pauses.pop(0)
+    log(f"YouTube is limiting requests. Waiting {wait // 60} minutes, then going on "
+        f"({len(LIMIT_PAUSES_S) - len(pauses)} of {len(LIMIT_PAUSES_S)})...")
+    if cancel is not None:
+        return not cancel.wait(wait)
+    time.sleep(wait)
+    return True
 
 
 def video_id(stem):
@@ -172,23 +213,28 @@ def last_error(lines):
 
 # ---- listing and fetching --------------------------------------------------------
 def list_videos(url, cancel=None):
-    """(name, [(id, title)]) for a video, playlist or channel link."""
+    """(name, [(id, title, length in seconds or None)]) for a video, playlist
+    or channel link."""
     code, lines = run(["--flat-playlist", "--no-warnings", "--sleep-requests", SLEEP_REQUESTS_S,
-                       "--print",
-                       f"{MARK}%(playlist_title|)s\t%(channel,uploader|)s\t%(id)s\t%(title|)s",
+                       "--print", f"{MARK}%(playlist_title|)s\t%(channel,uploader|)s\t%(id)s"
+                                  f"\t%(duration|)s\t%(title|)s",
                        url], cancel=cancel)
     videos, name = [], ""
     for line in lines:
         if not line.startswith(MARK):
             continue
         parts = line[len(MARK):].split("\t")
-        if len(parts) < 4 or not re.fullmatch(ID, parts[2]):
+        if len(parts) < 5 or not re.fullmatch(ID, parts[2]):
             continue
-        playlist, channel, vid, vtitle = parts[0], parts[1], parts[2], "\t".join(parts[3:])
+        playlist, channel, vid, vtitle = parts[0], parts[1], parts[2], "\t".join(parts[4:])
+        try:
+            length = float(parts[3]) or None
+        except ValueError:
+            length = None
         if not name:
             name = TAB_SUFFIX.sub("", playlist) or channel or vtitle
-        if all(v != vid for v, _ in videos):
-            videos.append((vid, vtitle))
+        if all(v[0] != vid for v in videos):
+            videos.append((vid, vtitle, length))
     if not videos:
         raise RuntimeError(f"no videos found at that link ({last_error(lines)})"
                            if code else "no videos found at that link")
@@ -209,11 +255,12 @@ def video_info(vid, cancel=None):
 
 
 def files_by_id(folder: Path):
-    """{video id: [subtitle files]} in a YouTube folder."""
+    """{video id: [transcript files]} in a YouTube folder: subtitles, and
+    transcripts of videos transcribed here."""
     out = {}
     if folder.is_dir():
         for p in folder.iterdir():
-            vid = video_id(p.stem) if p.suffix.lower() == ".vtt" else None
+            vid = video_id(p.stem) if p.suffix.lower() in transcripts.EXTS else None
             if vid:
                 out.setdefault(vid, []).append(p)
     return out
@@ -230,6 +277,7 @@ def keep_one(files, lang):
     """Keep one subtitle file per video: the uploader's regional track
     ("en-US"), else the uploader's plain one ("en"), else the automatic
     captions ("en-orig"), which then gets the plain name."""
+    files = [p for p in files if p.suffix.lower() == ".vtt"]
     if not files:
         return
     orig = f".{lang}-orig"
@@ -258,7 +306,7 @@ def due(info, now):
 
 
 def count(entry):
-    """Number of videos with subtitles in a YouTube folder entry."""
+    """Number of videos with subtitles or a transcript in a YouTube folder entry."""
     return len(files_by_id(Path(entry["transcripts"])))
 
 
@@ -266,7 +314,8 @@ def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
     """Fetch subtitles for every video at entry["youtube"] that doesn't have
     them yet. on_plan(n) once the work is known; on_video(i, title) as each
     video starts. Returns (new subtitle files, videos without subtitles,
-    total videos). Safe to stop and run again: finished videos are skipped."""
+    [(id, title, length)] of every video at the link). Safe to stop and run
+    again: finished videos (subtitles or a transcript) are skipped."""
     folder = Path(entry["transcripts"])
     lang = entry.get("lang") or "en"
     folder.mkdir(parents=True, exist_ok=True)
@@ -275,16 +324,16 @@ def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
     have = files_by_id(folder)
     state = read_state(folder)
     now = time.time()
-    todo = [(v, t) for v, t in videos
+    todo = [(v, t) for v, t, _ in videos
             if v not in have and (v not in state or due(state[v], now))]
-    waiting = sum(1 for v, _ in videos if v not in have and v in state and not due(state[v], now))
+    waiting = sum(1 for v, *_ in videos if v not in have and v in state and not due(state[v], now))
     log(f"{name}: {len(videos)} videos, {len(videos) - len(todo) - waiting} have subtitles, "
         f"{len(todo)} to fetch" + (f", {waiting} without subtitles (checked recently)"
                                    if waiting else "") + ".")
     if on_plan:
         on_plan(len(todo))
     if not todo:
-        return 0, waiting, len(videos)
+        return 0, waiting, videos
 
     titles = dict(todo)
     errors, uploader = {}, set()
@@ -309,15 +358,10 @@ def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
         while True:
             finished, complete = attempt([v for v in vids if v not in done], which, langs, on_start)
             done += finished
-            if complete or not limited.is_set() or not pauses or (cancel and cancel.is_set()):
+            if complete or not limited.is_set():
                 return done, complete
-            wait = pauses.pop(0)
-            log(f"YouTube is limiting requests. Waiting {wait // 60} minutes, then going on "
-                f"({len(LIMIT_PAUSES_S) - len(pauses)} of {len(LIMIT_PAUSES_S)})...")
-            if cancel is not None and cancel.wait(wait):
+            if not limit_pause(pauses, log, cancel):
                 return done, False
-            if cancel is None:
-                time.sleep(wait)
             limited.clear()
             halt.clear()
 
@@ -419,7 +463,74 @@ def fetch(entry, log=print, on_plan=None, on_video=None, cancel=None):
             "try again later to get the rest.")
     elif not complete:
         raise InterruptedError("stopped")
-    return new, missing + waiting, len(videos)
+    return new, missing + waiting, videos
+
+
+# ---- transcribing locally ----------------------------------------------------------
+def to_transcribe(entry, videos):
+    """The videos ([(id, title, length)]) of a YouTube folder entry still to
+    download and transcribe: nothing to search for them yet (no subtitles, no
+    transcript), and no failed try recently (see due, note_try)."""
+    folder = Path(entry["transcripts"])
+    have = files_by_id(folder)
+    failed = read_state(folder).get(FAILED_DOWNLOADS) or {}
+    now = time.time()
+    return [v for v in videos if v[0] not in have and (v[0] not in failed or due(failed[v[0]], now))]
+
+
+def note_try(entry, vid, ok):
+    """Remember a video whose audio download or transcription failed (tried
+    again after a day, up to MAX_TRIES times), or forget it once one works."""
+    folder = Path(entry["transcripts"])
+    state = read_state(folder)
+    failed = state.setdefault(FAILED_DOWNLOADS, {})
+    if ok:
+        if failed.pop(vid, None) is None:
+            return
+    else:
+        failed[vid] = {"checked": dt.datetime.now().isoformat(timespec="seconds"),
+                       "tries": failed.get(vid, {}).get("tries", 0) + 1}
+    if not failed:
+        del state[FAILED_DOWNLOADS]
+    folder.mkdir(parents=True, exist_ok=True)
+    write_atomic(folder / STATE, json.dumps(state, indent=1))
+
+
+def download_audio(vid, log=print, cancel=None, pauses=None):
+    """Download one video's audio (no picture) into DOWNLOAD_DIR, named like
+    its subtitles would be ("<date> <title> [id].webm"), so the transcript
+    gets the same name. Returns its Path; the caller deletes it. Raises
+    InterruptedError on Stop, Limited when YouTube keeps limiting requests
+    after the waits in `pauses` (a list from LIMIT_PAUSES_S, shared by a
+    run), RuntimeError when YouTube won't give the video (private, removed)."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    pauses = list(LIMIT_PAUSES_S) if pauses is None else pauses
+    while True:
+        code, lines = run(["-f", "bestaudio[ext=webm]/bestaudio", "--no-playlist",
+                           "--sleep-requests", SLEEP_REQUESTS_S, "--windows-filenames",
+                           "--no-progress", "-P", str(DOWNLOAD_DIR),
+                           "-o", OUT_TEMPLATE,
+                           "--print", f"after_move:{FILE_MARK}%(filepath)s", watch_url(vid)],
+                          cancel=cancel)
+        for line in lines:
+            if line.startswith(FILE_MARK) and Path(line[len(FILE_MARK):]).is_file():
+                return Path(line[len(FILE_MARK):])
+        if not is_limited(lines):
+            raise RuntimeError(last_error(lines) if code else "yt-dlp gave no audio file")
+        if not limit_pause(pauses, log, cancel):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("stopped")
+            raise Limited("YouTube is limiting requests right now")
+
+
+def clear_downloads():
+    """Delete audio left in DOWNLOAD_DIR if the app was closed mid-video."""
+    if DOWNLOAD_DIR.is_dir():
+        for p in DOWNLOAD_DIR.iterdir():
+            try:
+                p.unlink()
+            except OSError:
+                pass  # still in use by another running copy of the app
 
 
 # ---- transcripts you already have ------------------------------------------------
